@@ -6,10 +6,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod builder;
 mod config;
 mod orchestrator;
+mod executor; // Add executor module
 
 use builder::Builder;
 use config::DevpodConfig;
 use orchestrator::get_manager;
+use executor::RemoteExecutor; // Use RemoteExecutor
 
 /// Devpod: Edge Orchestrator
 #[derive(Parser)]
@@ -32,16 +34,45 @@ enum Commands {
     },
 
     /// Provision cluster, build, and deploy
-    Up,
+    Up {
+        /// Target environment (matches key in [cluster.<env>])
+        #[arg(long)]
+        env: Option<String>,
+    },
     
     /// Build and deploy (skip provision check)
-    Build,
+    Build {
+        /// Target environment
+        #[arg(long)]
+        env: Option<String>,
+    },
     
     /// Stop the environment
     Down,
     
     /// Check status
-    Status,
+    Status {
+         /// Target environment
+        #[arg(long)]
+        env: Option<String>,
+    },
+
+    /// List physical status of all nodes in an environment
+    Nodes {
+         /// Target environment
+        #[arg(long)]
+        env: String,
+    },
+
+    /// SSH into a cluster node
+    Ssh {
+        /// Target environment
+        #[arg(long)]
+        env: String,
+        
+        /// Node ID (index or IP/Host)
+        node: String,
+    }
 }
 
 #[tokio::main]
@@ -65,28 +96,30 @@ async fn main() -> Result<()> {
         let toml_content = format!(r#"[project]
 name = "{}"
 
-[provider]
-# Defaults to auto-detect (k3d for Mac/Win, k3s for Linux)
-type = "auto"
+# Local Development Cluster
+[cluster.dev]
+provider = "k3d"
 
-[registry]
-enabled = true
-port = 32000
+# Example Remote Environment
+[cluster.production-van]
+provider = "k3s"
+connection = "ssh"
+user = "admin"
+[[cluster.production-van.nodes]]
+role = "server"
+address = "192.168.1.10"
+runtime = "containerd"
 
 [infrastructure]
-# Ensure apps have a place to store data locally
 persistent_storage_enabled = true
 data_mount_path = "/var/lib/devpod/storage"
 
 [deployment]
-# Integration with your preferred build tool
 tool = "sailr"
 environment = "edge-production"
 
 [network]
-# Ports for drones to hit the ingest service
 expose = [
-  {{ host = 1883, container = 1883, protocol = "TCP" }}, 
   {{ host = 8080, container = 80, protocol = "HTTP" }}
 ]
 "#, project_name);
@@ -97,7 +130,7 @@ expose = [
         return Ok(());
     }
 
-    // Load config for other commands
+    // Load config
     let config = match DevpodConfig::load(&cli.config) {
         Ok(c) => c,
         Err(e) => {
@@ -106,23 +139,20 @@ expose = [
         }
     };
 
-    let manager = get_manager(&config);
-
     match cli.command {
-        Commands::Up => {
+        Commands::Up { env } => {
+            let manager = get_manager(&config, env.as_deref());
+            
             // 1. Provision Cluster
             manager.up(&config).await?;
             
             // 2. Build
             Builder::build(&config).await?;
             
-            // 3. Sync Images (Optional/Placeholder in current builder impl)
-            let images = Builder::export_images(&config).await?;
-            manager.sync_images(images).await?;
-            
-            // 4. Apply Manifests
+            // 3. Apply Manifests
             let manifest_path = Builder::get_manifest_path(&config);
             if manifest_path.exists() {
+                 manager.sync_secrets(&config).await?; // Call sync_secrets before apply
                  manager.apply_manifests(manifest_path).await?;
             } else {
                  println!("{} No manifests found at {:?}, skipping apply.", "!".yellow(), manifest_path);
@@ -130,7 +160,9 @@ expose = [
             
             println!("{} Environment is up and running.", "OK".green());
         },
-        Commands::Build => {
+        Commands::Build { env } => {
+             let manager = get_manager(&config, env.as_deref());
+             
              // Just build & deploy
              Builder::build(&config).await?;
              let manifest_path = Builder::get_manifest_path(&config);
@@ -140,29 +172,65 @@ expose = [
              println!("{} Build and deploy complete.", "OK".green());
         },
         Commands::Down => {
+            // Default to local down for safety, unless we want to support remote down (dangerous?)
+            let manager = get_manager(&config, None); 
             manager.down().await?;
             println!("{} Environment stopped.", "OK".green());
         },
-        Commands::Status => {
-            // Simple status check
-            // In real impl, check k8s nodes/pods
+        Commands::Status { env } => {
+             // For remote, maybe check kubectl get nodes using context?
              println!("{} Checking status...", "->".blue());
-             // This method signature in trait doesn't return info yet, just bool?
-             // Spec said: "Summarizes cluster health, node status, and pod readiness."
-             // We'll just call kubectl for now as a quick implementation if cluster is up
-             let status = tokio::process::Command::new("kubectl")
+             let context_arg = if let Some(e) = env {
+                 format!("devpod-{}", e)
+             } else {
+                 // Default context check (local)
+                 // This assumes current context is set correctly
+                 "default".to_string() // or whatever current is
+             };
+             
+             // Simplification: just run kubectl get nodes
+             // If remote env specified, we might need to set KUBECONFIG or context if we switched it
+             // But 'up' merges it.
+             let _ = tokio::process::Command::new("kubectl")
                 .arg("get")
                 .arg("nodes")
                 .status()
                 .await;
-            
-            if status.is_ok() && status.unwrap().success() {
-                 println!("{} Cluster is responsive.", "OK".green());
-                 let _ = tokio::process::Command::new("kubectl").arg("get").arg("pods").arg("-A").status().await;
+        },
+        Commands::Nodes { env } => {
+            if let Some(cluster) = config.get_cluster(&env) {
+                let user = cluster.user.as_deref().unwrap_or("root");
+                println!("{} Checking nodes for '{}'...", "->".blue(), env);
+                for node in &cluster.nodes {
+                     print!("  Node {} ({}) ... ", node.address, node.role);
+                     // Simple check: uptime
+                     match RemoteExecutor::execute(&node.address, user, "uptime").await {
+                         Ok(out) => println!("{} (up: {})", "OK".green(), out.trim()),
+                         Err(_) => println!("{}", "UNREACHABLE".red()),
+                     }
+                }
             } else {
-                 println!("{} Cluster is unreachable.", "!".red());
+                println!("{} Environment '{}' not found in config", "!".red(), env);
             }
         },
+        Commands::Ssh { env, node } => {
+            if let Some(cluster) = config.get_cluster(&env) {
+                 // Find node by address match or index?
+                 // Let's assume 'node' arg is the address for simplicity or try to match name if we added name field
+                 let target_node = cluster.nodes.iter().find(|n| n.address == node);
+                 
+                 if let Some(n) = target_node {
+                     let user = cluster.user.as_deref().unwrap_or("root");
+                     println!("{} Connecting to {}...", "->".blue(), n.address);
+                     RemoteExecutor::shell(&n.address, user).await?;
+                 } else {
+                     // Try using 'node' as index if integer?
+                     println!("{} Node '{}' not found in cluster config", "!".red(), node);
+                 }
+            } else {
+                 println!("{} Environment '{}' not found", "!".red(), env);
+            }
+        }
         Commands::Init { .. } => unreachable!(),
     }
 

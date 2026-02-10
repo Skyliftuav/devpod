@@ -5,15 +5,18 @@ use async_trait::async_trait;
 use colored::Colorize;
 use std::path::PathBuf;
 use tokio::process::Command;
+use walkdir::WalkDir;
 
 pub struct K3dManager {
     name: String,
+    registry_port: u16,
 }
 
 impl K3dManager {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, registry_port: u16) -> Self {
         Self {
             name: name.to_string(),
+            registry_port,
         }
     }
 }
@@ -149,10 +152,34 @@ impl ClusterManager for K3dManager {
     }
 
     async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
+         // Patch manifests for local registry access
+         println!("{} Patching manifests for k3d registry access...", "->".blue());
+         let port_str = self.registry_port.to_string();
+         let target = format!("localhost:{}", port_str);
+         let replacement = format!("host.k3d.internal:{}", port_str);
+
+         for entry in WalkDir::new(&yaml_path).into_iter().filter_map(|e| e.ok()) {
+             let path = entry.path();
+             if path.is_file() {
+                 if let Some(ext) = path.extension() {
+                     if ext == "yaml" || ext == "yml" {
+                         let content = std::fs::read_to_string(path).unwrap_or_default();
+                         if content.contains(&target) {
+                             println!("   Patching {}", path.display());
+                             let new_content = content.replace(&target, &replacement);
+                             if let Err(e) = std::fs::write(path, new_content) {
+                                 println!("{} Failed to patch {}: {}", "!".yellow(), path.display(), e);
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+
          println!("{} Applying manifests from {}...", "->".blue(), yaml_path.display());
          
          let status = Command::new("kubectl")
-            .args(["apply", "-f", yaml_path.to_str().unwrap()])
+            .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
             .status()
             .await
             .context("Failed to apply manifests")?;
@@ -162,6 +189,40 @@ impl ClusterManager for K3dManager {
         }
         
         println!("{} Manifests applied", "OK".green());
+        Ok(())
+    }
+
+    async fn sync_secrets(&self, config: &DevpodConfig) -> Result<()> {
+        if !config.secrets.enabled {
+            return Ok(());
+        }
+
+        let secret_set = config.secrets.set.as_deref().unwrap_or("default");
+        let context = format!("k3d-{}", self.name);
+
+        println!(
+            "{} Syncing secrets '{}' to context '{}'...",
+            "->".blue().bold(),
+            secret_set.cyan(),
+            context
+        );
+
+        let status = Command::new("ksecret")
+            .arg("sync")
+            .arg(secret_set)
+            .arg("-c")
+            .arg(&context)
+            .arg("-n")
+            .arg(&config.secrets.namespace)
+            .status()
+            .await
+            .context("Failed to run ksecret sync")?;
+
+        if !status.success() {
+            anyhow::bail!("Failed to sync secrets");
+        }
+        
+        println!("{} Secrets synced", "OK".green());
         Ok(())
     }
 }

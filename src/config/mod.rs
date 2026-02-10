@@ -1,17 +1,82 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevpodConfig {
     pub project: ProjectConfig,
+    
+    // Legacy support (optional now as we prefer cluster map)
     #[serde(default)]
-    pub provider: ProviderConfig,
+    pub provider: Option<ProviderConfig>,
+    
+    // New cluster map support
+    #[serde(default)]
+    pub cluster: HashMap<String, ClusterDefinition>,
+    
     #[serde(default)]
     pub registry: RegistryConfig,
     pub infrastructure: InfrastructureConfig,
     pub deployment: DeploymentConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_secrets_tool")]
+    pub tool: String,
+    pub set: Option<String>,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+fn default_secrets_tool() -> String {
+    "ksecret".to_string()
+}
+
+fn default_namespace() -> String {
+    "default".to_string()
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tool: default_secrets_tool(),
+            set: None,
+            namespace: default_namespace(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterDefinition {
+    pub provider: String, // k3d, k3s
+    #[serde(default)]
+    pub connection: Option<String>, // ssh
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub nodes: Vec<RemoteNodeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteNodeConfig {
+    pub role: String, // server, agent
+    pub address: String,
+    #[serde(default = "default_runtime")]
+    pub runtime: String, // containerd, docker
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+fn default_runtime() -> String {
+    "containerd".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,5 +168,10 @@ impl DevpodConfig {
         let content = std::fs::read_to_string(path)?;
         let config: DevpodConfig = toml::from_str(&content)?;
         Ok(config)
+    }
+
+    // Helper to get cluster config by environment name
+    pub fn get_cluster(&self, env: &str) -> Option<&ClusterDefinition> {
+        self.cluster.get(env)
     }
 }

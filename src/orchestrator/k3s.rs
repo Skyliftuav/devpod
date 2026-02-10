@@ -103,7 +103,7 @@ impl ClusterManager for K3sManager {
          println!("{} Applying manifests from {}...", "->".blue(), yaml_path.display());
          
          let status = Command::new("kubectl")
-            .args(["apply", "-f", yaml_path.to_str().unwrap()])
+            .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
             .status()
             .await
             .context("Failed to apply manifests")?;
@@ -113,6 +113,36 @@ impl ClusterManager for K3sManager {
         }
         
         println!("{} Manifests applied", "OK".green());
+        Ok(())
+    }
+
+    async fn sync_secrets(&self, config: &DevpodConfig) -> Result<()> {
+        if !config.secrets.enabled {
+            return Ok(());
+        }
+
+        let secret_set = config.secrets.set.as_deref().unwrap_or("default");
+        
+        println!(
+            "{} Syncing secrets '{}' to k3s...",
+            "->".blue().bold(),
+            secret_set.cyan(),
+        );
+
+        let status = Command::new("ksecret")
+            .arg("sync")
+            .arg(secret_set)
+            .arg("-n")
+            .arg(&config.secrets.namespace)
+            .status()
+            .await
+            .context("Failed to run ksecret sync")?;
+
+        if !status.success() {
+            anyhow::bail!("Failed to sync secrets");
+        }
+        
+        println!("{} Secrets synced", "OK".green());
         Ok(())
     }
 }
