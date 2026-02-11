@@ -63,6 +63,8 @@ pub struct ClusterDefinition {
     pub user: Option<String>,
     #[serde(default)]
     pub nodes: Vec<RemoteNodeConfig>,
+    #[serde(default)]
+    pub datastore_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

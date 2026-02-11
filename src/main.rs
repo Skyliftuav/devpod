@@ -47,8 +47,18 @@ enum Commands {
         env: Option<String>,
     },
     
-    /// Stop the environment
-    Down,
+    Down {
+        /// Target environment
+        #[arg(long)]
+        env: Option<String>,
+    },
+
+    /// Run setup script on all nodes (cgroups, deps, reboot)
+    Setup {
+        /// Target environment
+        #[arg(long)]
+        env: String,
+    },
     
     /// Check status
     Status {
@@ -171,10 +181,9 @@ expose = [
              }
              println!("{} Build and deploy complete.", "OK".green());
         },
-        Commands::Down => {
-            // Default to local down for safety, unless we want to support remote down (dangerous?)
-            let manager = get_manager(&config, None); 
-            manager.down().await?;
+        Commands::Down { env } => {
+            let manager = get_manager(&config, env.as_deref()); 
+            manager.down(&config).await?;
             println!("{} Environment stopped.", "OK".green());
         },
         Commands::Status { env } => {
@@ -230,7 +239,53 @@ expose = [
             } else {
                  println!("{} Environment '{}' not found", "!".red(), env);
             }
-        }
+        },
+        Commands::Setup { env } => {
+            if let Some(cluster) = config.get_cluster(&env) {
+                let user = cluster.user.as_deref().unwrap_or("root");
+                println!("{} Setting up nodes for '{}'...", "->".blue().bold(), env);
+                
+                for node in &cluster.nodes {
+                    println!("{} Configuring Node: {}", "->".blue(), node.address);
+                    
+                    // 1. Enable Cgroups (Debian/Ubuntu/Pi OS)
+                    // Check if already enabled? Or just force it.
+                    // appending to cmdline.txt
+                    let cmd_cgroups = "if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then 
+                        sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
+                        echo 'Updated /boot/firmware/cmdline.txt'
+                    elif ! grep -q 'cgroup_memory=1' /boot/cmdline.txt; then
+                        sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
+                         echo 'Updated /boot/cmdline.txt'
+                    else
+                        echo 'Cgroups already configured'
+                    fi";
+                    
+                    match RemoteExecutor::execute(&node.address, user, cmd_cgroups).await {
+                        Ok(out) => println!("   {} Cgroups: {}", "OK".green(), out.trim()),
+                        Err(e) => println!("{} Failed to configure cgroups on {}: {}", "!".red(), node.address, e),
+                    }
+
+                    // 2. Install Dependencies (curl, etc)
+                    println!("   Installing dependencies...");
+                    let cmd_deps = "sudo apt-get update && sudo apt-get install -y curl unzip";
+                    if let Err(e) = RemoteExecutor::execute(&node.address, user, cmd_deps).await {
+                         println!("{} Failed to install deps on {}: {}", "!".yellow(), node.address, e);
+                    } else {
+                         println!("   {} Dependencies installed", "OK".green());
+                    }
+
+                    // 3. Reboot
+                    println!("   {} Rebooting node {}...", "->".yellow(), node.address);
+                    // This command will fail because connection drops, which is expected
+                    let _ = RemoteExecutor::execute(&node.address, user, "sudo reboot").await;
+                }
+                
+                println!("{} Setup command sent to all nodes. Please wait for them to reboot.", "OK".green());
+            } else {
+                println!("{} Environment '{}' not found in config", "!".red(), env);
+            }
+        },
         Commands::Init { .. } => unreachable!(),
     }
 

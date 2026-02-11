@@ -111,7 +111,7 @@ impl ClusterManager for K3dManager {
         Ok(())
     }
 
-    async fn down(&self) -> Result<()> {
+    async fn down(&self, _config: &DevpodConfig) -> Result<()> {
          let status = Command::new("k3d")
             .args(["cluster", "delete", &self.name])
             .status()

@@ -73,7 +73,7 @@ impl ClusterManager for K3sManager {
         Ok(())
     }
 
-    async fn down(&self) -> Result<()> {
+    async fn down(&self, _config: &DevpodConfig) -> Result<()> {
         println!("{} Stopping k3s...", "->".blue());
         // For native k3s, this usually means `systemctl stop k3s` or killing the process.
         println!("{} Please stop k3s manually (e.g. systemctl stop k3s).", "!".yellow());
