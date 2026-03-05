@@ -36,7 +36,7 @@ impl ClusterManager for K3dManager {
             .output()
             .await
             .context("Failed to run docker info. Is Docker installed?")?;
-        
+
         if !docker_check.status.success() {
             anyhow::bail!("Docker is not running. Please start Docker Desktop/OrbStack.");
         }
@@ -62,25 +62,30 @@ impl ClusterManager for K3dManager {
                 let registry_name = format!("{}-registry", self.name);
                 args.push("--registry-create".to_string());
                 // Map local port to registry container
-                args.push(format!("{}:0.0.0.0:{}", registry_name, config.registry.port));
+                args.push(format!(
+                    "{}:0.0.0.0:{}",
+                    registry_name, config.registry.port
+                ));
             }
 
             // Map ports from network config
             for mapping in &config.network.expose {
                 args.push("-p".to_string());
-                args.push(format!("{}:{}@loadbalancer", mapping.host, mapping.container));
+                args.push(format!(
+                    "{}:{}@loadbalancer",
+                    mapping.host, mapping.container
+                ));
             }
-            
+
             // Map data volume if persistent storage is enabled
             if config.infrastructure.persistent_storage_enabled {
-                 let path_str = &config.infrastructure.data_mount_path;
-                 // In k3d (docker), we map a local volume to the node path
-                 // For simplicity, we'll map a local dir ./data/storage to the configured path
-                 let local_path = std::env::current_dir()?.join("data").join("storage");
-                 std::fs::create_dir_all(&local_path)?;
-                 
-                 args.push("--volume".to_string());
-                 args.push(format!("{}:{}@server:0", local_path.display(), path_str));
+                let path_str = &config.infrastructure.data_mount_path;
+                // Map local directory ./data/storage to the configured path
+                let local_path = std::env::current_dir()?.join("data").join("storage");
+                std::fs::create_dir_all(&local_path)?;
+
+                args.push("--volume".to_string());
+                args.push(format!("{}:{}@server:0", local_path.display(), path_str));
             }
 
             let status = Command::new("k3d")
@@ -94,25 +99,53 @@ impl ClusterManager for K3dManager {
             }
             println!("{} Cluster created", "OK".green());
         } else {
-             // Ensure it's started
-             let _ = Command::new("k3d")
+            // Ensure it's started
+            let _ = Command::new("k3d")
                 .args(["cluster", "start", &self.name])
                 .status()
                 .await;
-             println!("{} Cluster started", "OK".green());
+            println!("{} Cluster started", "OK".green());
         }
-        
-        // Merge kubeconfig
-        let _ = Command::new("k3d")
-            .args(["kubeconfig", "merge", &self.name, "--kubeconfig-merge-default"])
-            .status()
-            .await;
+
+        // Fetch and Merge kubeconfig natively without kubectl
+        let k3d_kubeconfig_out = Command::new("k3d")
+            .args(["kubeconfig", "get", &self.name])
+            .output()
+            .await
+            .context("Failed to get k3d kubeconfig")?;
+
+        if !k3d_kubeconfig_out.status.success() {
+            anyhow::bail!("Failed to fetch k3d kubeconfig");
+        }
+
+        let k3d_kubeconfig_str = String::from_utf8_lossy(&k3d_kubeconfig_out.stdout);
+        let incoming: crate::util::kubeconfig::Kubeconfig =
+            serde_yaml::from_str(&k3d_kubeconfig_str).context("Failed to parse k3d kubeconfig")?;
+
+        let home = dirs::home_dir().context("No home dir")?;
+        let default_kubeconfig = home.join(".kube").join("config");
+
+        std::fs::create_dir_all(default_kubeconfig.parent().unwrap())?;
+
+        let mut base_config = if default_kubeconfig.exists() {
+            let content = std::fs::read_to_string(&default_kubeconfig)?;
+            serde_yaml::from_str(&content).unwrap_or_default()
+        } else {
+            crate::util::kubeconfig::Kubeconfig::default()
+        };
+
+        crate::util::kubeconfig::merge_kubeconfig(&mut base_config, incoming);
+
+        let merged_yaml = serde_yaml::to_string(&base_config)?;
+        std::fs::write(&default_kubeconfig, merged_yaml)?;
+
+        println!("{} Kubeconfig merged", "OK".green());
 
         Ok(())
     }
 
     async fn down(&self, _config: &DevpodConfig) -> Result<()> {
-         let status = Command::new("k3d")
+        let status = Command::new("k3d")
             .args(["cluster", "delete", &self.name])
             .status()
             .await
@@ -130,7 +163,7 @@ impl ClusterManager for K3dManager {
         }
 
         println!("{} Importing images into k3d...", "->".blue());
-        
+
         let mut args = vec!["image".to_string(), "import".to_string()];
         for img in images {
             args.push(img.to_string_lossy().to_string());
@@ -152,42 +185,54 @@ impl ClusterManager for K3dManager {
     }
 
     async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
-         // Patch manifests for local registry access
-         println!("{} Patching manifests for k3d registry access...", "->".blue());
-         let port_str = self.registry_port.to_string();
-         let target = format!("localhost:{}", port_str);
-         let replacement = format!("host.k3d.internal:{}", port_str);
+        // Patch manifests for local registry access
+        println!(
+            "{} Patching manifests for k3d registry access...",
+            "->".blue()
+        );
+        let port_str = self.registry_port.to_string();
+        let target = format!("localhost:{}", port_str);
+        let replacement = format!("host.k3d.internal:{}", port_str);
 
-         for entry in WalkDir::new(&yaml_path).into_iter().filter_map(|e| e.ok()) {
-             let path = entry.path();
-             if path.is_file() {
-                 if let Some(ext) = path.extension() {
-                     if ext == "yaml" || ext == "yml" {
-                         let content = std::fs::read_to_string(path).unwrap_or_default();
-                         if content.contains(&target) {
-                             println!("   Patching {}", path.display());
-                             let new_content = content.replace(&target, &replacement);
-                             if let Err(e) = std::fs::write(path, new_content) {
-                                 println!("{} Failed to patch {}: {}", "!".yellow(), path.display(), e);
-                             }
-                         }
-                     }
-                 }
-             }
-         }
+        for entry in WalkDir::new(&yaml_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "yaml" || ext == "yml" {
+                        let content = std::fs::read_to_string(path).unwrap_or_default();
+                        if content.contains(&target) {
+                            println!("   Patching {}", path.display());
+                            let new_content = content.replace(&target, &replacement);
+                            if let Err(e) = std::fs::write(path, new_content) {
+                                println!(
+                                    "{} Failed to patch {}: {}",
+                                    "!".yellow(),
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-         println!("{} Applying manifests from {}...", "->".blue(), yaml_path.display());
-         
-         let status = Command::new("kubectl")
+        println!(
+            "{} Applying manifests from {}...",
+            "->".blue(),
+            yaml_path.display()
+        );
+
+        let status = Command::new("kubectl")
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
             .status()
             .await
             .context("Failed to apply manifests")?;
-        
+
         if !status.success() {
             anyhow::bail!("Failed to apply manifests");
         }
-        
+
         println!("{} Manifests applied", "OK".green());
         Ok(())
     }
@@ -221,7 +266,7 @@ impl ClusterManager for K3dManager {
         if !status.success() {
             anyhow::bail!("Failed to sync secrets");
         }
-        
+
         println!("{} Secrets synced", "OK".green());
         Ok(())
     }

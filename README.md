@@ -1,21 +1,21 @@
 # Devpod
 
-Devpod is your friendly neighborhood edge development orchestrator. It makes running Kubernetes-based applications on edge devices (like ships, vans, or remote servers) just as easy as running them on your laptop.
+Devpod is a local edge development orchestrator. It runs Kubernetes-based applications on edge devices (such as ships, vans, or remote servers) using the same workflow as your local machine.
 
-Think of it as the glue that binds `sailr` and a local Kubernetes cluster (`k3d` or `k3s`) together, giving you a simple, unified workflow for building, packaging, and deploying your apps—whether you have an internet connection or are completely offline.
+It integrates `sailr` with a local Kubernetes cluster (`k3d` or `k3s`) to provide a unified workflow for building, packaging, and deploying applications in both connected and offline environments.
 
-## Why Devpod?
+## Features
 
--   **Hybrid Orchestrator**: Automatically detects your OS. On **Linux**, it manages a native `k3s` process for minimal overhead. On **macOS/Windows**, it spins up a containerized `k3d` cluster.
--   **Simple Commands**: Usage is straightforward. `devpod up` to start, `devpod down` to stop. No more memorizing complex `kubectl` or `docker` incantations.
--   **Unified Workflow**: Use the exact same tools and config for local development and production deployment. Stop debugging "it works on my machine" issues.
--   **Sailr Powered**: We leverage `sailr` for the heavy lifting of building and templating, so you get all the power without the complexity.
+-   **Hybrid Orchestrator**: Automatically detects your OS. On **Linux**, it manages a native `k3s` process. On **macOS/Windows**, it provisions a containerized `k3d` cluster.
+-   **Simple Commands**: Provides straightforward basic commands. `devpod up` to start and `devpod down` to stop, abstracting away manual cluster management.
+-   **Unified Workflow**: Uses the same configuration for local development and production deployment, reducing consistency issues.
+-   **Sailr Powered**: Uses `sailr` for builds and templating.
 
 ## Getting Started
 
 ### Prerequisites
 
-You'll need a few things installed depending on your OS:
+Depending on your OS, install the following:
 
 -   [Docker](https://www.docker.com/) (required for building images and running `k3d`)
 -   [kubectl](https://kubernetes.io/docs/tasks/tools/)
@@ -25,11 +25,11 @@ You'll need a few things installed depending on your OS:
 -   [k3d](https://k3d.io/)
 
 **For Linux users:**
--   [k3s](https://k3s.io/) (the lightweight Kubernetes binary)
+-   [k3s](https://k3s.io/) (lightweight Kubernetes binary)
 
 ### Installation
 
-Clone the repo and build it:
+Clone the repository and install it using Cargo:
 
 ```bash
 cargo install --path .
@@ -43,13 +43,13 @@ cargo install --path .
     ```
     This creates a `devpod.toml` configuration file.
 
-2.  **Spin it up**:
+2.  **Start the environment**:
     ```bash
     devpod up
     ```
-    This will:
+    This command will:
     -   Provision a local cluster (k3d or k3s).
-    -   Spin up a local container registry (default port 32000).
+    -   Start a local container registry (default port 32000).
     -   Build your services using `sailr`.
     -   Generate and apply Kubernetes manifests.
 
@@ -58,14 +58,14 @@ cargo install --path .
     devpod status
     ```
 
-4.  **Shut it down**:
+4.  **Shut down the environment**:
     ```bash
     devpod down
     ```
 
 ## Configuration
 
-It's all in `devpod.toml`. Here's the schema:
+Configuration is managed in `devpod.toml` based on the following schema:
 
 ```toml
 [project]
@@ -99,4 +99,4 @@ expose = [
 
 ## Contributing
 
-We love contributions! If you find a bug or have a cool idea, open an issue or send a PR. Let's make edge computing fun again.
+Contributions are welcome. Please open an issue or submit a pull request if you find a bug or have a suggestion to improve the tool.

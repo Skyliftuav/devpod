@@ -11,16 +11,17 @@ use std::path::PathBuf;
 pub trait ClusterManager: Send + Sync {
     /// Provision and start the cluster
     async fn up(&self, config: &DevpodConfig) -> Result<()>;
-    
+
     /// Teardown the cluster
     async fn down(&self, config: &DevpodConfig) -> Result<()>;
-    
+
     /// Load container images into the cluster
+    #[allow(dead_code)]
     async fn sync_images(&self, images: Vec<PathBuf>) -> Result<()>;
-    
+
     /// Apply Kubernetes manifests
     async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()>;
-    
+
     /// Sync secrets via ksecret (or other tool)
     async fn sync_secrets(&self, config: &DevpodConfig) -> Result<()>;
 }
@@ -38,6 +39,9 @@ pub fn get_manager(config: &DevpodConfig, env_name: Option<&str>) -> Box<dyn Clu
     if cfg!(target_os = "linux") {
         Box::new(k3s::K3sManager::new(&config.project.name))
     } else {
-        Box::new(k3d::K3dManager::new(&config.project.name, config.registry.port))
+        Box::new(k3d::K3dManager::new(
+            &config.project.name,
+            config.registry.port,
+        ))
     }
 }
