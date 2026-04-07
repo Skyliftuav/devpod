@@ -512,16 +512,21 @@ impl ClusterManager for RemoteManager {
         // Use the context we just created/merged
         let context_name = format!("devpod-{}", self.env_name);
 
-        let status = Command::new("kubectl")
+        let output = Command::new("kubectl")
             .arg("--context")
             .arg(&context_name)
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
-            .status()
+            .output()
             .await
             .map_err(|e| DevpodError::Command(format!("Failed to apply manifests: {}", e)))?;
 
-        if !status.success() {
-            return Err(DevpodError::Command("Failed to apply manifests".into()));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DevpodError::Command(format!(
+                "kubectl apply failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
         }
         Ok(())
     }

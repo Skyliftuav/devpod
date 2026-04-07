@@ -1,4 +1,3 @@
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -10,6 +9,7 @@ mod executor;
 mod orchestrator; // Add executor module
 mod util;
 
+use crate::error::Result;
 use builder::Builder;
 use config::DevpodConfig;
 use executor::{Executor, RemoteExecutor};

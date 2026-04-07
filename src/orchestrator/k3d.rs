@@ -48,12 +48,28 @@ impl ClusterManager for K3dManager {
         // Validate host ports before asking k3d to create the cluster.
         // This avoids long create+rollback cycles when a bind would fail.
         for mapping in &config.network.expose {
-            if TcpListener::bind(("0.0.0.0", mapping.host)).is_err() {
-                return Err(DevpodError::Command(format!(
-                    "Port {} is already allocated (network.expose host port).\n\
-                     Remediation: free the port (`lsof -i :{0}`), or update [network].expose host value in devpod.toml.",
-                    mapping.host
-                )));
+            match TcpListener::bind(("0.0.0.0", mapping.host)) {
+                Ok(_) => {}
+                Err(e) => {
+                    let detail = match e.kind() {
+                        std::io::ErrorKind::AddrInUse => format!(
+                            "Port {} is already in use (network.expose host port).\n\
+                             Remediation: free the port (`lsof -i :{}`), or update [network].expose host value in devpod.toml.",
+                            mapping.host, mapping.host
+                        ),
+                        std::io::ErrorKind::PermissionDenied => format!(
+                            "Permission denied binding to port {} (network.expose host port).\n\
+                             Remediation: use an unprivileged port or run with elevated privileges.",
+                            mapping.host
+                        ),
+                        _ => format!(
+                            "Cannot bind to port {} (network.expose host port): {}\n\
+                             Remediation: check network configuration or update [network].expose host value in devpod.toml.",
+                            mapping.host, e
+                        ),
+                    };
+                    return Err(DevpodError::Command(detail));
+                }
             }
         }
 
@@ -242,14 +258,19 @@ impl ClusterManager for K3dManager {
 
         info!("Applying manifests from {}...", yaml_path.display());
 
-        let status = Command::new("kubectl")
+        let output = Command::new("kubectl")
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
-            .status()
+            .output()
             .await
             .map_err(|e| DevpodError::Command(format!("Failed to apply manifests: {}", e)))?;
 
-        if !status.success() {
-            return Err(DevpodError::Command("Failed to apply manifests".into()));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DevpodError::Command(format!(
+                "kubectl apply failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
         }
 
         info!("Manifests applied");

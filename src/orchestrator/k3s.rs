@@ -109,14 +109,19 @@ impl ClusterManager for K3sManager {
         // Assumes KUBECONFIG is set or uses default ~/.kube/config
         info!("Applying manifests from {}...", yaml_path.display());
 
-        let status = Command::new("kubectl")
+        let output = Command::new("kubectl")
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
-            .status()
+            .output()
             .await
             .map_err(|e| DevpodError::Command(format!("Failed to apply manifests: {}", e)))?;
 
-        if !status.success() {
-            return Err(DevpodError::Command("Failed to apply manifests".into()));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DevpodError::Command(format!(
+                "kubectl apply failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
         }
 
         info!("Manifests applied");
