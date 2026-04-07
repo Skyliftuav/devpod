@@ -168,8 +168,12 @@ fn default_protocol() -> String {
 impl DevpodConfig {
     pub fn load(path: &str) -> crate::error::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: DevpodConfig = toml::from_str(&content)
-            .map_err(|e| crate::error::DevpodError::Config(e.to_string()))?;
+        let config: DevpodConfig = toml::from_str(&content).map_err(|e| {
+            crate::error::DevpodError::Config(format!(
+                "failed to parse config file '{}': {}",
+                path, e
+            ))
+        })?;
         Ok(config)
     }
 
