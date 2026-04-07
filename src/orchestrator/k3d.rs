@@ -3,6 +3,7 @@ use crate::error::{DevpodError, Result};
 use crate::orchestrator::ClusterManager;
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::net::TcpListener;
 use tokio::process::Command;
 use tracing::info;
 use walkdir::WalkDir;
@@ -42,6 +43,18 @@ impl ClusterManager for K3dManager {
             return Err(DevpodError::Command(
                 "Docker is not running. Please start Docker Desktop/OrbStack.".into(),
             ));
+        }
+
+        // Validate host ports before asking k3d to create the cluster.
+        // This avoids long create+rollback cycles when a bind would fail.
+        for mapping in &config.network.expose {
+            if TcpListener::bind(("0.0.0.0", mapping.host)).is_err() {
+                return Err(DevpodError::Command(format!(
+                    "Port {} is already allocated (network.expose host port).\n\
+                     Remediation: free the port (`lsof -i :{0}`), or update [network].expose host value in devpod.toml.",
+                    mapping.host
+                )));
+            }
         }
 
         // Check if cluster exists
@@ -100,7 +113,11 @@ impl ClusterManager for K3dManager {
                 })?;
 
             if !status.success() {
-                return Err(DevpodError::Command("k3d cluster creation failed".into()));
+                return Err(DevpodError::Command(
+                    "k3d cluster creation failed (orchestrator=k3d).\n\
+                     Common cause: host port conflict in [network].expose. Run `devpod up` again after fixing conflicts."
+                        .into(),
+                ));
             }
             info!("Cluster created");
         } else {

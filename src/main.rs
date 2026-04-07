@@ -137,7 +137,7 @@ environment = "edge-production"
 
 [network]
 expose = [
-  {{ host = 8080, container = 80, protocol = "HTTP" }}
+  {{ host = 8081, container = 80, protocol = "HTTP" }}
 ]
 "#,
             project_name
