@@ -1,10 +1,10 @@
 use crate::config::DevpodConfig;
+use crate::error::{DevpodError, Result};
 use crate::orchestrator::ClusterManager;
-use anyhow::{Context, Result};
 use async_trait::async_trait;
-use colored::Colorize;
 use std::path::PathBuf;
 use tokio::process::Command;
+use tracing::{info, warn};
 
 pub struct K3sManager {
     name: String,
@@ -26,12 +26,19 @@ impl K3sManager {
             return Ok(());
         }
 
-        println!("{} Downloading k3s binary...", "->".blue());
+        info!("Downloading k3s binary...");
         std::fs::create_dir_all(self.bin_path.parent().unwrap())?;
 
         // Download binary (x86_64 statically linked)
         let url = "https://github.com/k3s-io/k3s/releases/download/v1.30.0%2Bk3s1/k3s";
-        let resp = reqwest::get(url).await?.bytes().await?;
+        let resp = reqwest::get(url)
+            .await
+            .map_err(|e| DevpodError::Network(format!("Failed to download k3s: {}", e)))?
+            .bytes()
+            .await
+            .map_err(|e| {
+                DevpodError::Network(format!("Failed to read k3s binary stream: {}", e))
+            })?;
         std::fs::write(&self.bin_path, resp)?;
 
         // Make executable
@@ -52,42 +59,27 @@ impl ClusterManager for K3sManager {
     async fn up(&self, _config: &DevpodConfig) -> Result<()> {
         self.ensure_binary().await?;
 
-        println!(
-            "{} Starting native k3s instance for '{}'...",
-            "->".blue().bold(),
-            self.name.cyan()
-        );
+        info!("Starting native k3s instance for '{}'...", self.name);
 
         // Start k3s process in the background
-        let args = vec![
+        let args = [
             "server".to_string(),
             "--write-kubeconfig-mode".to_string(),
             "644".to_string(),
         ];
 
-        println!(
-            "{} Executing: {} {}",
-            "->".blue(),
-            self.bin_path.display(),
-            args.join(" ")
-        );
+        info!("Executing: {} {}", self.bin_path.display(), args.join(" "));
 
         // Warn the user to ensure k3s is running via systemd if applicable
-        println!(
-            "{} Please ensure k3s is running via systemd or manually.",
-            "!".yellow()
-        );
+        warn!("Please ensure k3s is running via systemd or manually.");
 
         Ok(())
     }
 
     async fn down(&self, _config: &DevpodConfig) -> Result<()> {
-        println!("{} Stopping k3s...", "->".blue());
+        info!("Stopping k3s...");
         // Stop k3s via systemctl or by killing the process
-        println!(
-            "{} Please stop k3s manually (e.g. systemctl stop k3s).",
-            "!".yellow()
-        );
+        warn!("Please stop k3s manually (e.g. systemctl stop k3s).");
         Ok(())
     }
 
@@ -98,18 +90,13 @@ impl ClusterManager for K3sManager {
 
         for img in images {
             let target = images_dir.join(img.file_name().unwrap());
-            println!("{} Importing image to {}", "->".blue(), target.display());
+            info!("Importing image to {}", target.display());
 
             // This copy might require root permissions
             if let Err(e) = std::fs::copy(&img, &target) {
-                println!(
-                    "{} Failed to copy image (permissions?): {}",
-                    "!".yellow(),
-                    e
-                );
-                println!(
-                    "{} You might need to run: sudo cp {} {}",
-                    "->".blue(),
+                warn!("Failed to copy image (permissions?): {}", e);
+                info!(
+                    "You might need to run: sudo cp {} {}",
                     img.display(),
                     target.display()
                 );
@@ -120,23 +107,19 @@ impl ClusterManager for K3sManager {
 
     async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
         // Assumes KUBECONFIG is set or uses default ~/.kube/config
-        println!(
-            "{} Applying manifests from {}...",
-            "->".blue(),
-            yaml_path.display()
-        );
+        info!("Applying manifests from {}...", yaml_path.display());
 
         let status = Command::new("kubectl")
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
             .status()
             .await
-            .context("Failed to apply manifests")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to apply manifests: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to apply manifests");
+            return Err(DevpodError::Command("Failed to apply manifests".into()));
         }
 
-        println!("{} Manifests applied", "OK".green());
+        info!("Manifests applied");
         Ok(())
     }
 
@@ -147,11 +130,7 @@ impl ClusterManager for K3sManager {
 
         let secret_set = config.secrets.set.as_deref().unwrap_or("default");
 
-        println!(
-            "{} Syncing secrets '{}' to k3s...",
-            "->".blue().bold(),
-            secret_set.cyan(),
-        );
+        info!("Syncing secrets '{}' to k3s...", secret_set);
 
         let status = Command::new("ksecret")
             .arg("sync")
@@ -160,13 +139,13 @@ impl ClusterManager for K3sManager {
             .arg(&config.secrets.namespace)
             .status()
             .await
-            .context("Failed to run ksecret sync")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to run ksecret sync: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to sync secrets");
+            return Err(DevpodError::Command("Failed to sync secrets".into()));
         }
 
-        println!("{} Secrets synced", "OK".green());
+        info!("Secrets synced");
         Ok(())
     }
 }

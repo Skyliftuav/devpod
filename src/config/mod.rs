@@ -4,22 +4,22 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevpodConfig {
     pub project: ProjectConfig,
-    
+
     // Legacy support (optional now as we prefer cluster map)
     #[serde(default)]
     pub provider: Option<ProviderConfig>,
-    
+
     // New cluster map support
     #[serde(default)]
     pub cluster: HashMap<String, ClusterDefinition>,
-    
+
     #[serde(default)]
     pub registry: RegistryConfig,
     pub infrastructure: InfrastructureConfig,
     pub deployment: DeploymentConfig,
     #[serde(default)]
     pub network: NetworkConfig,
-    
+
     #[serde(default)]
     pub secrets: SecretsConfig,
 }
@@ -166,9 +166,10 @@ fn default_protocol() -> String {
 }
 
 impl DevpodConfig {
-    pub fn load(path: &str) -> anyhow::Result<Self> {
+    pub fn load(path: &str) -> crate::error::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: DevpodConfig = toml::from_str(&content)?;
+        let config: DevpodConfig = toml::from_str(&content)
+            .map_err(|e| crate::error::DevpodError::Config(e.to_string()))?;
         Ok(config)
     }
 

@@ -3,7 +3,8 @@ pub mod k3s;
 pub mod remote;
 
 use crate::config::DevpodConfig;
-use anyhow::Result;
+use crate::error::Result;
+use crate::executor::RemoteExecutor;
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -31,7 +32,7 @@ pub fn get_manager(config: &DevpodConfig, env_name: Option<&str>) -> Box<dyn Clu
     if let Some(env) = env_name {
         // Check if this environment is defined in the cluster map
         if config.get_cluster(env).is_some() {
-            return Box::new(remote::RemoteManager::new(env));
+            return Box::new(remote::RemoteManager::new(env, Box::new(RemoteExecutor)));
         }
     }
 

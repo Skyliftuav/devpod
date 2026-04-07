@@ -1,18 +1,15 @@
 use crate::config::DevpodConfig;
-use anyhow::{Context, Result};
-use colored::Colorize;
+use crate::error::{DevpodError, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tracing::{info, instrument, warn};
 
 pub struct Builder;
 
 impl Builder {
+    #[instrument(skip(config), fields(tool = %config.deployment.tool, env = %config.deployment.environment))]
     pub async fn build(config: &DevpodConfig) -> Result<()> {
-        println!(
-            "{} Building services via {}...",
-            "->".blue().bold(),
-            config.deployment.tool
-        );
+        info!("Building services via {}...", config.deployment.tool);
 
         let tool = &config.deployment.tool;
         if tool == "sailr" {
@@ -23,10 +20,10 @@ impl Builder {
                 .arg(&config.deployment.environment)
                 .status()
                 .await
-                .context("Failed to run sailr build")?;
+                .map_err(|e| DevpodError::Command(format!("Failed to run sailr build: {}", e)))?;
 
             if !status.success() {
-                anyhow::bail!("sailr build failed");
+                return Err(DevpodError::Command("sailr build failed".into()));
             }
 
             // Run sailr generate
@@ -36,17 +33,15 @@ impl Builder {
                 .arg(&config.deployment.environment)
                 .status()
                 .await
-                .context("Failed to run sailr generate")?;
+                .map_err(|e| {
+                    DevpodError::Command(format!("Failed to run sailr generate: {}", e))
+                })?;
 
             if !status.success() {
-                anyhow::bail!("sailr generate failed");
+                return Err(DevpodError::Command("sailr generate failed".into()));
             }
         } else {
-            println!(
-                "{} Unknown build tool '{}', skipping build step",
-                "!".yellow(),
-                tool
-            );
+            warn!("Unknown build tool '{}', skipping build step", tool);
         }
 
         Ok(())

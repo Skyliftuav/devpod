@@ -5,13 +5,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod builder;
 mod config;
+mod error;
 mod executor;
 mod orchestrator; // Add executor module
 mod util;
 
 use builder::Builder;
 use config::DevpodConfig;
-use executor::RemoteExecutor;
+use executor::{Executor, RemoteExecutor};
 use orchestrator::get_manager; // Use RemoteExecutor
 
 /// Devpod: Edge Orchestrator
@@ -219,7 +220,8 @@ expose = [
                 for node in &cluster.nodes {
                     print!("  Node {} ({}) ... ", node.address, node.role);
                     // Simple check: uptime
-                    match RemoteExecutor::execute(&node.address, user, "uptime").await {
+                    let executor = RemoteExecutor;
+                    match executor.execute(&node.address, user, "uptime").await {
                         Ok(out) => println!("{} (up: {})", "OK".green(), out.trim()),
                         Err(_) => println!("{}", "UNREACHABLE".red()),
                     }
@@ -236,7 +238,8 @@ expose = [
                 if let Some(n) = target_node {
                     let user = cluster.user.as_deref().unwrap_or("root");
                     println!("{} Connecting to {}...", "->".blue(), n.address);
-                    RemoteExecutor::shell(&n.address, user).await?;
+                    let executor = RemoteExecutor;
+                    executor.shell(&n.address, user).await?;
                 } else {
                     // Try using 'node' as index if integer?
                     println!("{} Node '{}' not found in cluster config", "!".red(), node);
@@ -264,7 +267,8 @@ expose = [
                         echo 'Cgroups already configured'
                     fi";
 
-                    match RemoteExecutor::execute(&node.address, user, cmd_cgroups).await {
+                    let executor = RemoteExecutor;
+                    match executor.execute(&node.address, user, cmd_cgroups).await {
                         Ok(out) => println!("   {} Cgroups: {}", "OK".green(), out.trim()),
                         Err(e) => println!(
                             "{} Failed to configure cgroups on {}: {}",
@@ -277,7 +281,7 @@ expose = [
                     // 2. Install Dependencies (curl, etc)
                     println!("   Installing dependencies...");
                     let cmd_deps = "sudo apt-get update && sudo apt-get install -y curl unzip";
-                    if let Err(e) = RemoteExecutor::execute(&node.address, user, cmd_deps).await {
+                    if let Err(e) = executor.execute(&node.address, user, cmd_deps).await {
                         println!(
                             "{} Failed to install deps on {}: {}",
                             "!".yellow(),
@@ -291,7 +295,7 @@ expose = [
                     // 3. Reboot
                     println!("   {} Rebooting node {}...", "->".yellow(), node.address);
                     // Node reboots; expected to fail when connection drops
-                    let _ = RemoteExecutor::execute(&node.address, user, "sudo reboot").await;
+                    let _ = executor.execute(&node.address, user, "sudo reboot").await;
                 }
 
                 println!(

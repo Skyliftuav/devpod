@@ -1,10 +1,10 @@
 use crate::config::DevpodConfig;
+use crate::error::{DevpodError, Result};
 use crate::orchestrator::ClusterManager;
-use anyhow::{Context, Result};
 use async_trait::async_trait;
-use colored::Colorize;
 use std::path::PathBuf;
 use tokio::process::Command;
+use tracing::info;
 use walkdir::WalkDir;
 
 pub struct K3dManager {
@@ -24,21 +24,24 @@ impl K3dManager {
 #[async_trait]
 impl ClusterManager for K3dManager {
     async fn up(&self, config: &DevpodConfig) -> Result<()> {
-        println!(
-            "{} Provisioning k3d cluster '{}'...",
-            "->".blue().bold(),
-            self.name.cyan()
-        );
+        info!("Provisioning k3d cluster '{}'...", self.name);
 
         // Check if Docker is running
         let docker_check = Command::new("docker")
             .arg("info")
             .output()
             .await
-            .context("Failed to run docker info. Is Docker installed?")?;
+            .map_err(|e| {
+                DevpodError::Command(format!(
+                    "Failed to run docker info. Is Docker installed? {}",
+                    e
+                ))
+            })?;
 
         if !docker_check.status.success() {
-            anyhow::bail!("Docker is not running. Please start Docker Desktop/OrbStack.");
+            return Err(DevpodError::Command(
+                "Docker is not running. Please start Docker Desktop/OrbStack.".into(),
+            ));
         }
 
         // Check if cluster exists
@@ -46,7 +49,7 @@ impl ClusterManager for K3dManager {
             .args(["cluster", "list", &self.name])
             .output()
             .await
-            .context("Failed to check k3d cluster")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to check k3d cluster: {}", e)))?;
 
         if !check.status.success() {
             // Create cluster
@@ -92,19 +95,21 @@ impl ClusterManager for K3dManager {
                 .args(&args)
                 .status()
                 .await
-                .context("Failed to create k3d cluster")?;
+                .map_err(|e| {
+                    DevpodError::Command(format!("Failed to create k3d cluster: {}", e))
+                })?;
 
             if !status.success() {
-                anyhow::bail!("k3d cluster creation failed");
+                return Err(DevpodError::Command("k3d cluster creation failed".into()));
             }
-            println!("{} Cluster created", "OK".green());
+            info!("Cluster created");
         } else {
             // Ensure it's started
             let _ = Command::new("k3d")
                 .args(["cluster", "start", &self.name])
                 .status()
                 .await;
-            println!("{} Cluster started", "OK".green());
+            info!("Cluster started");
         }
 
         // Fetch and Merge kubeconfig natively without kubectl
@@ -112,17 +117,26 @@ impl ClusterManager for K3dManager {
             .args(["kubeconfig", "get", &self.name])
             .output()
             .await
-            .context("Failed to get k3d kubeconfig")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to get k3d kubeconfig: {}", e)))?;
 
         if !k3d_kubeconfig_out.status.success() {
-            anyhow::bail!("Failed to fetch k3d kubeconfig");
+            return Err(DevpodError::Command(
+                "Failed to fetch k3d kubeconfig".into(),
+            ));
         }
 
         let k3d_kubeconfig_str = String::from_utf8_lossy(&k3d_kubeconfig_out.stdout);
         let incoming: crate::util::kubeconfig::Kubeconfig =
-            serde_yaml::from_str(&k3d_kubeconfig_str).context("Failed to parse k3d kubeconfig")?;
+            serde_yaml::from_str(&k3d_kubeconfig_str).map_err(|e| {
+                DevpodError::KubeconfigMerge(format!("Failed to parse k3d kubeconfig: {}", e))
+            })?;
 
-        let home = dirs::home_dir().context("No home dir")?;
+        let home = dirs::home_dir().ok_or_else(|| {
+            DevpodError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No home dir",
+            ))
+        })?;
         let default_kubeconfig = home.join(".kube").join("config");
 
         std::fs::create_dir_all(default_kubeconfig.parent().unwrap())?;
@@ -139,7 +153,7 @@ impl ClusterManager for K3dManager {
         let merged_yaml = serde_yaml::to_string(&base_config)?;
         std::fs::write(&default_kubeconfig, merged_yaml)?;
 
-        println!("{} Kubeconfig merged", "OK".green());
+        info!("Kubeconfig merged");
 
         Ok(())
     }
@@ -149,10 +163,10 @@ impl ClusterManager for K3dManager {
             .args(["cluster", "delete", &self.name])
             .status()
             .await
-            .context("Failed to delete k3d cluster")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to delete k3d cluster: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to delete k3d cluster");
+            return Err(DevpodError::Command("Failed to delete k3d cluster".into()));
         }
         Ok(())
     }
@@ -162,7 +176,7 @@ impl ClusterManager for K3dManager {
             return Ok(());
         }
 
-        println!("{} Importing images into k3d...", "->".blue());
+        info!("Importing images into k3d...");
 
         let mut args = vec!["image".to_string(), "import".to_string()];
         for img in images {
@@ -175,21 +189,18 @@ impl ClusterManager for K3dManager {
             .args(&args)
             .status()
             .await
-            .context("Failed to import images to k3d")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to import images to k3d: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to import images");
+            return Err(DevpodError::Command("Failed to import images".into()));
         }
-        println!("{} Images imported", "OK".green());
+        info!("Images imported");
         Ok(())
     }
 
     async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
         // Patch manifests for local registry access
-        println!(
-            "{} Patching manifests for k3d registry access...",
-            "->".blue()
-        );
+        info!("Patching manifests for k3d registry access...");
         let port_str = self.registry_port.to_string();
         let target = format!("localhost:{}", port_str);
         let replacement = format!("host.k3d.internal:{}", port_str);
@@ -201,15 +212,10 @@ impl ClusterManager for K3dManager {
                     if ext == "yaml" || ext == "yml" {
                         let content = std::fs::read_to_string(path).unwrap_or_default();
                         if content.contains(&target) {
-                            println!("   Patching {}", path.display());
+                            info!("Patching {}", path.display());
                             let new_content = content.replace(&target, &replacement);
                             if let Err(e) = std::fs::write(path, new_content) {
-                                println!(
-                                    "{} Failed to patch {}: {}",
-                                    "!".yellow(),
-                                    path.display(),
-                                    e
-                                );
+                                tracing::warn!("Failed to patch {}: {}", path.display(), e);
                             }
                         }
                     }
@@ -217,23 +223,19 @@ impl ClusterManager for K3dManager {
             }
         }
 
-        println!(
-            "{} Applying manifests from {}...",
-            "->".blue(),
-            yaml_path.display()
-        );
+        info!("Applying manifests from {}...", yaml_path.display());
 
         let status = Command::new("kubectl")
             .args(["apply", "-f", yaml_path.to_str().unwrap(), "--recursive"])
             .status()
             .await
-            .context("Failed to apply manifests")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to apply manifests: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to apply manifests");
+            return Err(DevpodError::Command("Failed to apply manifests".into()));
         }
 
-        println!("{} Manifests applied", "OK".green());
+        info!("Manifests applied");
         Ok(())
     }
 
@@ -245,11 +247,9 @@ impl ClusterManager for K3dManager {
         let secret_set = config.secrets.set.as_deref().unwrap_or("default");
         let context = format!("k3d-{}", self.name);
 
-        println!(
-            "{} Syncing secrets '{}' to context '{}'...",
-            "->".blue().bold(),
-            secret_set.cyan(),
-            context
+        info!(
+            "Syncing secrets '{}' to context '{}'...",
+            secret_set, context
         );
 
         let status = Command::new("ksecret")
@@ -261,13 +261,13 @@ impl ClusterManager for K3dManager {
             .arg(&config.secrets.namespace)
             .status()
             .await
-            .context("Failed to run ksecret sync")?;
+            .map_err(|e| DevpodError::Command(format!("Failed to run ksecret sync: {}", e)))?;
 
         if !status.success() {
-            anyhow::bail!("Failed to sync secrets");
+            return Err(DevpodError::Command("Failed to sync secrets".into()));
         }
 
-        println!("{} Secrets synced", "OK".green());
+        info!("Secrets synced");
         Ok(())
     }
 }
