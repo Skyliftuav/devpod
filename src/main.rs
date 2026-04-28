@@ -13,6 +13,7 @@ use builder::Builder;
 use config::{ClusterDefinition, DevpodConfig, RemoteNodeConfig};
 use executor::RemoteExecutor;
 use orchestrator::get_manager; // Use RemoteExecutor
+use orchestrator::remote::RemoteManager;
 
 /// Devpod: Edge Orchestrator
 #[derive(Parser)]
@@ -86,6 +87,13 @@ enum Commands {
         /// Target environment
         #[arg(long)]
         env: Option<String>,
+    },
+
+    /// Refresh kubeconfig contexts for a remote environment
+    SyncContext {
+        /// Target environment
+        #[arg(long)]
+        env: String,
     },
 
     /// Run setup script on all nodes (cgroups, deps, reboot)
@@ -249,6 +257,23 @@ expose = [
             let manager = get_manager(&config, env.as_deref());
             manager.down(&config).await?;
             println!("{} Environment stopped.", "OK".green());
+        }
+        Commands::SyncContext { env } => {
+            let cluster = config.get_cluster(&env).with_context(|| {
+                format!("Environment '{}' not found in config", env)
+            })?;
+
+            if cluster.provider != "k3s" {
+                anyhow::bail!(
+                    "sync-context only supports remote k3s environments. '{}' uses provider '{}'",
+                    env,
+                    cluster.provider
+                );
+            }
+
+            let manager = RemoteManager::new(&env);
+            manager.sync_context(&config).await?;
+            println!("{} Kubeconfig context refreshed.", "OK".green());
         }
         Commands::Status { env: _ } => {
             println!("{} Checking status...", "->".blue());

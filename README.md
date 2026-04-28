@@ -59,7 +59,13 @@ cargo install --path .
     devpod status
     ```
 
-4.  **Shut down the environment**:
+4.  **Refresh kubeconfig after reinitializing a remote cluster**:
+    ```bash
+    devpod sync-context --env production-van
+    ```
+    This refreshes the local `devpod-<env>-tailnet`, `devpod-<env>-lan`, and `devpod-<env>-direct` contexts from the live remote `k3s` server without reprovisioning or redeploying.
+
+5.  **Shut down the environment**:
     ```bash
     devpod down
     ```
