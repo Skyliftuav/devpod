@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait ClusterManager: Send + Sync {
     /// Provision and start the cluster
     async fn up(&self, config: &DevpodConfig) -> Result<()>;
@@ -20,7 +20,7 @@ pub trait ClusterManager: Send + Sync {
     async fn sync_images(&self, images: Vec<PathBuf>) -> Result<()>;
 
     /// Apply Kubernetes manifests
-    async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()>;
+    async fn apply_manifests(&self, config: &DevpodConfig, yaml_path: PathBuf) -> Result<()>;
 
     /// Sync secrets via ksecret (or other tool)
     async fn sync_secrets(&self, config: &DevpodConfig) -> Result<()>;

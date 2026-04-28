@@ -21,7 +21,7 @@ impl K3dManager {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ClusterManager for K3dManager {
     async fn up(&self, config: &DevpodConfig) -> Result<()> {
         println!(
@@ -184,7 +184,7 @@ impl ClusterManager for K3dManager {
         Ok(())
     }
 
-    async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
+    async fn apply_manifests(&self, _config: &DevpodConfig, yaml_path: PathBuf) -> Result<()> {
         // Patch manifests for local registry access
         println!(
             "{} Patching manifests for k3d registry access...",
