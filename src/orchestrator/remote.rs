@@ -57,6 +57,15 @@ impl RemoteManager {
         format!("devpod-{}-{}", self.env_name, suffix)
     }
 
+    fn managed_context_names(&self) -> Vec<String> {
+        vec![
+            self.legacy_context_name(),
+            self.context_name("tailnet"),
+            self.context_name("lan"),
+            self.context_name("direct"),
+        ]
+    }
+
     fn endpoint_specs(
         &self,
         cluster: &ClusterDefinition,
@@ -251,6 +260,11 @@ impl RemoteManager {
             Kubeconfig::default()
         };
 
+        crate::util::kubeconfig::remove_entries_by_name(
+            &mut base_config,
+            &self.managed_context_names(),
+        );
+
         for incoming in configs {
             crate::util::kubeconfig::merge_kubeconfig(&mut base_config, incoming);
         }
@@ -297,6 +311,41 @@ impl RemoteManager {
         self.merge_kubeconfigs(configs, &current_context)?;
         println!("{} Kubeconfig merged", "OK".green());
         Ok(())
+    }
+
+    fn remote_cluster<'a>(&self, config: &'a DevpodConfig) -> Result<&'a ClusterDefinition> {
+        let cluster = config.get_cluster(&self.env_name).context(format!(
+            "Cluster definition for '{}' not found in config",
+            self.env_name
+        ))?;
+
+        if cluster.provider != "k3s" {
+            anyhow::bail!(
+                "Context sync is only supported for remote k3s environments. '{}' uses provider '{}'",
+                self.env_name,
+                cluster.provider
+            );
+        }
+
+        Ok(cluster)
+    }
+
+    fn primary_server<'a>(&self, cluster: &'a ClusterDefinition) -> Result<&'a RemoteNodeConfig> {
+        cluster
+            .nodes
+            .iter()
+            .find(|node| node.role == "server")
+            .context("No server node defined for remote cluster")
+    }
+
+    pub async fn sync_context(&self, config: &DevpodConfig) -> Result<()> {
+        let cluster = self.remote_cluster(config)?;
+        let user = cluster.user.as_deref().unwrap_or("root");
+        let primary = self.primary_server(cluster)?;
+        let kubeconfig_target = self.resolve_node_host(cluster, primary, user).await?;
+
+        self.fetch_and_merge_kubeconfig(cluster, primary, &kubeconfig_target, user)
+            .await
     }
 
     fn generate_token() -> String {
@@ -782,14 +831,7 @@ impl RemoteManager {
 #[async_trait(?Send)]
 impl ClusterManager for RemoteManager {
     async fn up(&self, config: &DevpodConfig) -> Result<()> {
-        let cluster = config.get_cluster(&self.env_name).context(format!(
-            "Cluster definition for '{}' not found in config",
-            self.env_name
-        ))?;
-
-        if cluster.provider != "k3s" {
-            anyhow::bail!("Remote provider must be 'k3s'");
-        }
+        let cluster = self.remote_cluster(config)?;
 
         let user = cluster.user.as_deref().unwrap_or("root");
         let servers: Vec<RemoteNodeConfig> = cluster
@@ -1004,14 +1046,7 @@ impl ClusterManager for RemoteManager {
     }
 
     async fn down(&self, config: &DevpodConfig) -> Result<()> {
-        let cluster = config.get_cluster(&self.env_name).context(format!(
-            "Cluster definition for '{}' not found in config",
-            self.env_name
-        ))?;
-
-        if cluster.provider != "k3s" {
-            anyhow::bail!("Remote provider must be 'k3s'");
-        }
+        let cluster = self.remote_cluster(config)?;
 
         let user = cluster.user.as_deref().unwrap_or("root");
         let servers: Vec<RemoteNodeConfig> = cluster
@@ -1054,12 +1089,7 @@ impl ClusterManager for RemoteManager {
             println!("   {} Server uninstalled & data purged", "OK".green());
         }
 
-        let mut context_names = vec![
-            self.legacy_context_name(),
-            self.context_name("lan"),
-            self.context_name("tailnet"),
-            self.context_name("direct"),
-        ];
+        let mut context_names = self.managed_context_names();
         context_names.sort();
         context_names.dedup();
 
@@ -1088,15 +1118,8 @@ impl ClusterManager for RemoteManager {
 
     async fn apply_manifests(&self, config: &DevpodConfig, yaml_path: PathBuf) -> Result<()> {
         println!("{} Applying manifests to remote...", "->".blue());
-        let cluster = config.get_cluster(&self.env_name).context(format!(
-            "Cluster definition for '{}' not found in config",
-            self.env_name
-        ))?;
-        let primary = cluster
-            .nodes
-            .iter()
-            .find(|node| node.role == "server")
-            .context("No server node defined for remote cluster")?;
+        let cluster = self.remote_cluster(config)?;
+        let primary = self.primary_server(cluster)?;
         let context_name = self.current_context_name(cluster, primary);
 
         let status = Command::new("kubectl")
@@ -1118,15 +1141,8 @@ impl ClusterManager for RemoteManager {
             return Ok(());
         }
 
-        let cluster = config.get_cluster(&self.env_name).context(format!(
-            "Cluster definition for '{}' not found in config",
-            self.env_name
-        ))?;
-        let primary = cluster
-            .nodes
-            .iter()
-            .find(|node| node.role == "server")
-            .context("No server node defined for remote cluster")?;
+        let cluster = self.remote_cluster(config)?;
+        let primary = self.primary_server(cluster)?;
         let context_name = self.current_context_name(cluster, primary);
         let secret_set = config.secrets.set.as_deref().unwrap_or("default");
 

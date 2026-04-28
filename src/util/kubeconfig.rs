@@ -104,3 +104,61 @@ pub fn merge_kubeconfig(base: &mut Kubeconfig, incoming: Kubeconfig) {
         base.current_context = incoming.current_context;
     }
 }
+
+pub fn remove_entries_by_name(base: &mut Kubeconfig, names: &[String]) {
+    base.clusters.retain(|cluster| !names.contains(&cluster.name));
+    base.contexts.retain(|context| !names.contains(&context.name));
+    base.users.retain(|user| !names.contains(&user.name));
+
+    if names.contains(&base.current_context) {
+        base.current_context.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remove_entries_by_name, Kubeconfig};
+
+    #[test]
+    fn remove_entries_by_name_prunes_only_matching_entries() {
+        let mut kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: keep
+    cluster:
+      server: https://keep:6443
+  - name: devpod-devlab-tailnet
+    cluster:
+      server: https://tailnet:6443
+contexts:
+  - name: keep
+    context:
+      cluster: keep
+      user: keep
+  - name: devpod-devlab-tailnet
+    context:
+      cluster: devpod-devlab-tailnet
+      user: devpod-devlab-tailnet
+users:
+  - name: keep
+    user: {}
+  - name: devpod-devlab-tailnet
+    user: {}
+current-context: devpod-devlab-tailnet
+"#,
+        )
+        .unwrap();
+
+        remove_entries_by_name(&mut kubeconfig, &[String::from("devpod-devlab-tailnet")]);
+
+        assert_eq!(kubeconfig.clusters.len(), 1);
+        assert_eq!(kubeconfig.clusters[0].name, "keep");
+        assert_eq!(kubeconfig.contexts.len(), 1);
+        assert_eq!(kubeconfig.contexts[0].name, "keep");
+        assert_eq!(kubeconfig.users.len(), 1);
+        assert_eq!(kubeconfig.users[0].name, "keep");
+        assert!(kubeconfig.current_context.is_empty());
+    }
+}
