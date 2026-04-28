@@ -47,7 +47,7 @@ impl K3sManager {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ClusterManager for K3sManager {
     async fn up(&self, _config: &DevpodConfig) -> Result<()> {
         self.ensure_binary().await?;
@@ -118,7 +118,7 @@ impl ClusterManager for K3sManager {
         Ok(())
     }
 
-    async fn apply_manifests(&self, yaml_path: PathBuf) -> Result<()> {
+    async fn apply_manifests(&self, _config: &DevpodConfig, yaml_path: PathBuf) -> Result<()> {
         // Assumes KUBECONFIG is set or uses default ~/.kube/config
         println!(
             "{} Applying manifests from {}...",

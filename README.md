@@ -10,6 +10,7 @@ It integrates `sailr` with a local Kubernetes cluster (`k3d` or `k3s`) to provid
 -   **Simple Commands**: Provides straightforward basic commands. `devpod up` to start and `devpod down` to stop, abstracting away manual cluster management.
 -   **Unified Workflow**: Uses the same configuration for local development and production deployment, reducing consistency issues.
 -   **Sailr Powered**: Uses `sailr` for builds and templating.
+-   **Portable Remote Access**: Remote `k3s` environments can publish stable LAN and Tailscale management endpoints so the same cluster can move between networks without rewriting kubeconfig.
 
 ## Getting Started
 
@@ -96,6 +97,66 @@ expose = [
   { host = 8080, container = 80, protocol = "HTTP" }
 ]
 ```
+
+### Portable Remote K3s Example
+
+```toml
+[project]
+name = "portable-edge"
+
+[cluster.production-van]
+provider = "k3s"
+connection = "ssh"
+user = "admin"
+
+[[cluster.production-van.nodes]]
+role = "server"
+name = "control-1"
+bootstrap_address = "192.168.1.10"
+runtime = "containerd"
+
+[[cluster.production-van.nodes]]
+role = "agent"
+name = "worker-1"
+bootstrap_address = "192.168.1.11"
+runtime = "containerd"
+
+[cluster.production-van.access]
+mode = "dual"
+primary = "tailscale"
+lan_domain = "local"
+published_ports = [
+  { node = "control-1", port = 6443, protocol = "TCP", name = "k8s-api" },
+  { node = "worker-1", port = 8080, protocol = "HTTP", name = "dashboard" }
+]
+
+[cluster.production-van.tailscale]
+enabled = true
+tailnet_domain = "example.ts.net"
+auth_key_env = "TAILSCALE_AUTH_KEY"
+api_key_env = "TAILSCALE_API_KEY"
+tags = ["tag:k3s"]
+ssh = true
+
+[infrastructure]
+persistent_storage_enabled = true
+data_mount_path = "/var/lib/devpod/storage"
+
+[deployment]
+tool = "sailr"
+environment = "edge-production"
+```
+
+Remote `k3s` provisioning now does the following:
+
+-   Uses `bootstrap_address` for first contact and cluster joins on the local network.
+-   Sets a stable node hostname from `nodes[].name`, enables Avahi, and generates a LAN kubeconfig context such as `devpod-production-van-lan`.
+-   Installs and configures Tailscale when enabled, then generates a Tailscale kubeconfig context such as `devpod-production-van-tailnet`.
+-   Also generates a direct-address kubeconfig context such as `devpod-production-van-direct` so on-site management can still work even if MagicDNS or `.local` name resolution is unavailable.
+-   Makes the preferred context the primary access mode, usually Tailscale.
+
+Set `TAILSCALE_AUTH_KEY` in your shell before running `devpod up` for a portable Tailscale-managed cluster.
+Set `TAILSCALE_API_KEY` as well if you want `devpod down` to delete the device from the Tailscale admin plane instead of only logging it out and purging the node locally.
 
 ## Contributing
 

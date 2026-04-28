@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -10,7 +10,7 @@ mod orchestrator; // Add executor module
 mod util;
 
 use builder::Builder;
-use config::DevpodConfig;
+use config::{ClusterDefinition, DevpodConfig, RemoteNodeConfig};
 use executor::RemoteExecutor;
 use orchestrator::get_manager; // Use RemoteExecutor
 
@@ -24,6 +24,40 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+fn node_connection_candidates(cluster: &ClusterDefinition, node: &RemoteNodeConfig) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if cluster.tailscale_enabled() {
+        if let Some(domain) = cluster.tailnet_domain() {
+            candidates.push(node.tailscale_hostname(domain));
+        }
+    }
+
+    if cluster.access_mode() != "tailscale-only" {
+        candidates.push(node.lan_hostname(cluster.lan_domain()));
+    }
+
+    if let Some(address) = node.bootstrap_address() {
+        candidates.push(address.to_string());
+    }
+
+    candidates.dedup();
+    candidates
+}
+
+async fn resolve_node_host(
+    cluster: &ClusterDefinition,
+    node: &RemoteNodeConfig,
+    user: &str,
+) -> Option<String> {
+    let candidates = node_connection_candidates(cluster, node);
+    let candidate_refs: Vec<_> = candidates.iter().map(String::as_str).collect();
+
+    RemoteExecutor::first_reachable(candidate_refs.iter().copied(), user)
+        .await
+        .or_else(|| node.bootstrap_address().map(str::to_string))
 }
 
 #[derive(Subcommand)]
@@ -123,8 +157,22 @@ connection = "ssh"
 user = "admin"
 [[cluster.production-van.nodes]]
 role = "server"
-address = "192.168.1.10"
+name = "control-1"
+bootstrap_address = "192.168.1.10"
 runtime = "containerd"
+
+[cluster.production-van.access]
+mode = "dual"
+primary = "tailscale"
+lan_domain = "local"
+
+[cluster.production-van.tailscale]
+enabled = true
+tailnet_domain = "example.ts.net"
+auth_key_env = "TAILSCALE_AUTH_KEY"
+api_key_env = "TAILSCALE_API_KEY"
+tags = ["tag:k3s"]
+ssh = true
 
 [infrastructure]
 persistent_storage_enabled = true
@@ -175,7 +223,7 @@ expose = [
             let manifest_path = Builder::get_manifest_path(&config);
             if manifest_path.exists() {
                 manager.sync_secrets(&config).await?; // Call sync_secrets before apply
-                manager.apply_manifests(manifest_path).await?;
+                manager.apply_manifests(&config, manifest_path).await?;
             } else {
                 println!(
                     "{} No manifests found at {:?}, skipping apply.",
@@ -193,7 +241,7 @@ expose = [
             Builder::build(&config).await?;
             let manifest_path = Builder::get_manifest_path(&config);
             if manifest_path.exists() {
-                manager.apply_manifests(manifest_path).await?;
+                manager.apply_manifests(&config, manifest_path).await?;
             }
             println!("{} Build and deploy complete.", "OK".green());
         }
@@ -217,11 +265,18 @@ expose = [
                 let user = cluster.user.as_deref().unwrap_or("root");
                 println!("{} Checking nodes for '{}'...", "->".blue(), env);
                 for node in &cluster.nodes {
-                    print!("  Node {} ({}) ... ", node.address, node.role);
-                    // Simple check: uptime
-                    match RemoteExecutor::execute(&node.address, user, "uptime").await {
-                        Ok(out) => println!("{} (up: {})", "OK".green(), out.trim()),
-                        Err(_) => println!("{}", "UNREACHABLE".red()),
+                    let label = node
+                        .bootstrap_address()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| node.stable_name());
+                    print!("  Node {} ({}) ... ", label, node.role);
+                    let target = resolve_node_host(cluster, node, user).await;
+                    match target {
+                        Some(host) => match RemoteExecutor::execute(&host, user, "uptime").await {
+                            Ok(out) => println!("{} (up: {})", "OK".green(), out.trim()),
+                            Err(_) => println!("{}", "UNREACHABLE".red()),
+                        },
+                        None => println!("{}", "UNCONFIGURED".red()),
                     }
                 }
             } else {
@@ -230,13 +285,15 @@ expose = [
         }
         Commands::Ssh { env, node } => {
             if let Some(cluster) = config.get_cluster(&env) {
-                // Match node by address
-                let target_node = cluster.nodes.iter().find(|n| n.address == node);
+                let target_node = cluster.nodes.iter().find(|n| n.matches_node_ref(&node));
 
                 if let Some(n) = target_node {
                     let user = cluster.user.as_deref().unwrap_or("root");
-                    println!("{} Connecting to {}...", "->".blue(), n.address);
-                    RemoteExecutor::shell(&n.address, user).await?;
+                    let host = resolve_node_host(cluster, n, user)
+                        .await
+                        .context("No reachable SSH target found for node")?;
+                    println!("{} Connecting to {}...", "->".blue(), host);
+                    RemoteExecutor::shell(&host, user).await?;
                 } else {
                     // Try using 'node' as index if integer?
                     println!("{} Node '{}' not found in cluster config", "!".red(), node);
@@ -251,7 +308,16 @@ expose = [
                 println!("{} Setting up nodes for '{}'...", "->".blue().bold(), env);
 
                 for node in &cluster.nodes {
-                    println!("{} Configuring Node: {}", "->".blue(), node.address);
+                    let Some(host) = node.bootstrap_address() else {
+                        println!(
+                            "{} Skipping node '{}' because it has no bootstrap address",
+                            "!".yellow(),
+                            node.stable_name()
+                        );
+                        continue;
+                    };
+
+                    println!("{} Configuring Node: {}", "->".blue(), host);
 
                     // 1. Enable cgroups for Docker/K3s compatibility
                     let cmd_cgroups = "if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then 
@@ -264,12 +330,12 @@ expose = [
                         echo 'Cgroups already configured'
                     fi";
 
-                    match RemoteExecutor::execute(&node.address, user, cmd_cgroups).await {
+                    match RemoteExecutor::execute(host, user, cmd_cgroups).await {
                         Ok(out) => println!("   {} Cgroups: {}", "OK".green(), out.trim()),
                         Err(e) => println!(
                             "{} Failed to configure cgroups on {}: {}",
                             "!".red(),
-                            node.address,
+                            host,
                             e
                         ),
                     }
@@ -277,21 +343,16 @@ expose = [
                     // 2. Install Dependencies (curl, etc)
                     println!("   Installing dependencies...");
                     let cmd_deps = "sudo apt-get update && sudo apt-get install -y curl unzip";
-                    if let Err(e) = RemoteExecutor::execute(&node.address, user, cmd_deps).await {
-                        println!(
-                            "{} Failed to install deps on {}: {}",
-                            "!".yellow(),
-                            node.address,
-                            e
-                        );
+                    if let Err(e) = RemoteExecutor::execute(host, user, cmd_deps).await {
+                        println!("{} Failed to install deps on {}: {}", "!".yellow(), host, e);
                     } else {
                         println!("   {} Dependencies installed", "OK".green());
                     }
 
                     // 3. Reboot
-                    println!("   {} Rebooting node {}...", "->".yellow(), node.address);
+                    println!("   {} Rebooting node {}...", "->".yellow(), host);
                     // Node reboots; expected to fail when connection drops
-                    let _ = RemoteExecutor::execute(&node.address, user, "sudo reboot").await;
+                    let _ = RemoteExecutor::execute(host, user, "sudo reboot").await;
                 }
 
                 println!(
