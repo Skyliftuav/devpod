@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use colored::Colorize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevpodConfig {
+    #[serde(default)]
+    pub schema_version: u32,
+
     pub project: ProjectConfig,
 
     // Legacy support (optional now as we prefer cluster map)
@@ -12,6 +16,9 @@ pub struct DevpodConfig {
     // New cluster map support
     #[serde(default)]
     pub cluster: HashMap<String, ClusterDefinition>,
+
+    #[serde(default)]
+    pub cluster_defaults: Option<ClusterDefinition>,
 
     #[serde(default)]
     pub registry: RegistryConfig,
@@ -56,6 +63,7 @@ impl Default for SecretsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterDefinition {
+    #[serde(default = "default_cluster_provider")]
     pub provider: String, // k3d, k3s
     #[serde(default)]
     pub connection: Option<String>, // ssh
@@ -69,6 +77,10 @@ pub struct ClusterDefinition {
     pub access: ClusterAccessConfig,
     #[serde(default)]
     pub tailscale: TailscaleConfig,
+}
+
+fn default_cluster_provider() -> String {
+    "k3s".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,8 +279,120 @@ fn default_protocol() -> String {
 impl DevpodConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: DevpodConfig = toml::from_str(&content)?;
+        let mut config: DevpodConfig = toml::from_str(&content)?;
+
+        // Validate schema version
+        if config.schema_version > 1 {
+            anyhow::bail!(
+                "Unsupported config schema version: {}. Supported versions: 0, 1. Please upgrade devpod.",
+                config.schema_version
+            );
+        }
+        if config.schema_version == 0 {
+            println!(
+                "{} Warning: Config schema version is 0 (legacy). Please run 'devpod config migrate' to upgrade.",
+                "WARN".yellow()
+            );
+        }
+
+        // Find parent directory of the config file
+        let config_path = std::path::Path::new(path);
+        let base_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+        // Scan base_dir/clusters and base_dir/.devpod/clusters
+        let dirs_to_scan = vec![
+            base_dir.join("clusters"),
+            base_dir.join(".devpod").join("clusters"),
+        ];
+
+        // A wrapper struct to try parsing files as multiple clusters:
+        // [cluster.name]
+        // ...
+        #[derive(Deserialize)]
+        struct MultiClusterFile {
+            #[serde(default)]
+            cluster: HashMap<String, ClusterDefinition>,
+        }
+
+        for dir in dirs_to_scan {
+            if dir.is_dir() {
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let file_path = entry.path();
+                    if file_path.is_file() && file_path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                        let file_content = std::fs::read_to_string(&file_path)?;
+                        
+                        // Try parsing as multi-cluster wrapper first
+                        let mut loaded = false;
+                        if let Ok(multi) = toml::from_str::<MultiClusterFile>(&file_content) {
+                            if !multi.cluster.is_empty() {
+                                for (name, cluster_def) in multi.cluster {
+                                    config.cluster.insert(name, cluster_def);
+                                }
+                                loaded = true;
+                            }
+                        }
+
+                        if !loaded {
+                            // Otherwise try parsing as a single flat ClusterDefinition
+                            match toml::from_str::<ClusterDefinition>(&file_content) {
+                                Ok(cluster_def) => {
+                                    if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
+                                        config.cluster.insert(stem.to_string(), cluster_def);
+                                    }
+                                }
+                                Err(err) => {
+                                    anyhow::bail!(
+                                        "Failed to parse cluster config file {}: {}",
+                                        file_path.display(),
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge defaults
+        if let Some(ref defaults) = config.cluster_defaults {
+            for (_, cluster) in config.cluster.iter_mut() {
+                cluster.merge_defaults(defaults);
+            }
+        }
+
         Ok(config)
+    }
+
+    pub fn migrate(path: &str) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let mut config: DevpodConfig = toml::from_str(&content)?;
+
+        if config.schema_version > 0 {
+            anyhow::bail!("Configuration is already migrated (schema_version = {})", config.schema_version);
+        }
+
+        let config_path = std::path::Path::new(path);
+        let base_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let clusters_dir = base_dir.join("clusters");
+        std::fs::create_dir_all(&clusters_dir)?;
+
+        for (name, cluster_def) in &config.cluster {
+            let cluster_content = toml::to_string(cluster_def)?;
+            let cluster_file = clusters_dir.join(format!("{}.toml", name));
+            std::fs::write(cluster_file, cluster_content)?;
+            println!("  {} Migrated cluster context to clusters/{}.toml", "OK".green(), name);
+        }
+
+        // Update config to schema version 1 and clear the embedded cluster map
+        config.schema_version = 1;
+        config.cluster.clear();
+
+        // Save back to base config
+        let updated_content = toml::to_string(&config)?;
+        std::fs::write(path, updated_content)?;
+        Ok(())
     }
 
     // Helper to get cluster config by environment name
@@ -303,6 +427,87 @@ impl ClusterDefinition {
             .tailnet_domain
             .as_deref()
             .filter(|domain| !domain.trim().is_empty())
+    }
+
+    pub fn merge_defaults(&mut self, defaults: &ClusterDefinition) {
+        if self.provider == "k3s" && defaults.provider != "k3s" {
+            self.provider = defaults.provider.clone();
+        }
+        if self.connection.is_none() {
+            self.connection = defaults.connection.clone();
+        }
+        if self.user.is_none() {
+            self.user = defaults.user.clone();
+        }
+        if self.datastore_endpoint.is_none() {
+            self.datastore_endpoint = defaults.datastore_endpoint.clone();
+        }
+        
+        // Merge access
+        if self.access.mode == "dual" && defaults.access.mode != "dual" {
+            self.access.mode = defaults.access.mode.clone();
+        }
+        if self.access.primary == "tailscale" && defaults.access.primary != "tailscale" {
+            self.access.primary = defaults.access.primary.clone();
+        }
+        if self.access.lan_domain == "local" && defaults.access.lan_domain != "local" {
+            self.access.lan_domain = defaults.access.lan_domain.clone();
+        }
+        if self.access.published_ports.is_empty() {
+            self.access.published_ports = defaults.access.published_ports.clone();
+        }
+
+        // Merge tailscale
+        if !self.tailscale.enabled && defaults.tailscale.enabled {
+            self.tailscale.enabled = true;
+        }
+        if self.tailscale.tailnet_domain.is_none() {
+            self.tailscale.tailnet_domain = defaults.tailscale.tailnet_domain.clone();
+        }
+        if self.tailscale.auth_key_env == "TAILSCALE_AUTH_KEY" && defaults.tailscale.auth_key_env != "TAILSCALE_AUTH_KEY" {
+            self.tailscale.auth_key_env = defaults.tailscale.auth_key_env.clone();
+        }
+        if self.tailscale.api_key_env == "TAILSCALE_API_KEY" && defaults.tailscale.api_key_env != "TAILSCALE_API_KEY" {
+            self.tailscale.api_key_env = defaults.tailscale.api_key_env.clone();
+        }
+        if self.tailscale.tags.is_empty() {
+            self.tailscale.tags = defaults.tailscale.tags.clone();
+        }
+        if self.tailscale.ssh && !defaults.tailscale.ssh {
+            self.tailscale.ssh = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DevpodState {
+    pub active_environment: Option<String>,
+}
+
+impl DevpodState {
+    pub fn load(config_path: &str) -> Self {
+        let path = std::path::Path::new(config_path);
+        let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let state_path = base_dir.join(".devpod").join("state.toml");
+        
+        if let Ok(content) = std::fs::read_to_string(state_path) {
+            if let Ok(state) = toml::from_str::<DevpodState>(&content) {
+                return state;
+            }
+        }
+        DevpodState::default()
+    }
+
+    pub fn save(&self, config_path: &str) -> anyhow::Result<()> {
+        let path = std::path::Path::new(config_path);
+        let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let devpod_dir = base_dir.join(".devpod");
+        
+        std::fs::create_dir_all(&devpod_dir)?;
+        let state_path = devpod_dir.join("state.toml");
+        let content = toml::to_string(self)?;
+        std::fs::write(state_path, content)?;
+        Ok(())
     }
 }
 
@@ -401,5 +606,81 @@ mod tests {
         assert!(!cluster.tailscale_enabled());
         assert!(!cluster.prefers_tailscale());
         assert!(cluster.prefers_lan());
+    }
+
+    #[test]
+    fn test_merge_defaults() {
+        let defaults = ClusterDefinition {
+            provider: "k3d".to_string(),
+            connection: Some("ssh".to_string()),
+            user: Some("dev-user".to_string()),
+            nodes: Vec::new(),
+            datastore_endpoint: None,
+            access: super::ClusterAccessConfig {
+                mode: "tailscale-only".to_string(),
+                primary: "tailscale".to_string(),
+                lan_domain: "defaults.local".to_string(),
+                published_ports: Vec::new(),
+            },
+            tailscale: TailscaleConfig {
+                enabled: true,
+                tailnet_domain: Some("defaults.ts.net".to_string()),
+                auth_key_env: "TEST_AUTH_KEY".to_string(),
+                api_key_env: "TEST_API_KEY".to_string(),
+                tags: vec!["tag:test".to_string()],
+                ssh: false,
+            },
+        };
+
+        let mut cluster = ClusterDefinition {
+            provider: "k3s".to_string(),
+            connection: None,
+            user: None,
+            nodes: Vec::new(),
+            datastore_endpoint: None,
+            access: Default::default(),
+            tailscale: TailscaleConfig::default(),
+        };
+
+        cluster.merge_defaults(&defaults);
+
+        assert_eq!(cluster.provider, "k3d"); // Inherited defaults provider
+        assert_eq!(cluster.connection, Some("ssh".to_string())); // Merged connection
+        assert_eq!(cluster.user, Some("dev-user".to_string())); // Merged user
+        assert_eq!(cluster.access.mode, "tailscale-only"); // Merged access mode
+        assert_eq!(cluster.access.lan_domain, "defaults.local"); // Merged lan domain
+        assert!(cluster.tailscale.enabled); // Merged tailscale enabled
+        assert_eq!(cluster.tailscale.tailnet_domain, Some("defaults.ts.net".to_string())); // Merged tailnet
+        assert_eq!(cluster.tailscale.auth_key_env, "TEST_AUTH_KEY"); // Merged auth key env
+        assert_eq!(cluster.tailscale.api_key_env, "TEST_API_KEY"); // Merged api key env
+        assert_eq!(cluster.tailscale.tags, vec!["tag:test".to_string()]); // Merged tags
+        assert!(!cluster.tailscale.ssh); // Merged ssh setting
+
+        // Test that an explicit non-default provider is not overwritten
+        let mut cluster_custom = ClusterDefinition {
+            provider: "custom".to_string(),
+            connection: None,
+            user: None,
+            nodes: Vec::new(),
+            datastore_endpoint: None,
+            access: Default::default(),
+            tailscale: TailscaleConfig::default(),
+        };
+        cluster_custom.merge_defaults(&defaults);
+        assert_eq!(cluster_custom.provider, "custom");
+    }
+
+    #[test]
+    fn test_devpod_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("devpod.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut state = super::DevpodState::default();
+        state.active_environment = Some("test-env".to_string());
+        state.save(config_path.to_str().unwrap()).unwrap();
+
+        let loaded = super::DevpodState::load(config_path.to_str().unwrap());
+        assert_eq!(loaded.active_environment, Some("test-env".to_string()));
     }
 }

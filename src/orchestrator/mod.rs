@@ -13,7 +13,7 @@ pub trait ClusterManager: Send + Sync {
     async fn up(&self, config: &DevpodConfig) -> Result<()>;
 
     /// Teardown the cluster
-    async fn down(&self, config: &DevpodConfig) -> Result<()>;
+    async fn down(&self, config: &DevpodConfig, purge_tailscale: bool) -> Result<()>;
 
     /// Load container images into the cluster
     #[allow(dead_code)]

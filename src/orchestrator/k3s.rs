@@ -81,7 +81,7 @@ impl ClusterManager for K3sManager {
         Ok(())
     }
 
-    async fn down(&self, _config: &DevpodConfig) -> Result<()> {
+    async fn down(&self, _config: &DevpodConfig, _purge_tailscale: bool) -> Result<()> {
         println!("{} Stopping k3s...", "->".blue());
         // Stop k3s via systemctl or by killing the process
         println!(

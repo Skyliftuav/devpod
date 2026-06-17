@@ -193,20 +193,25 @@ impl RemoteManager {
     }
 
     async fn fetch_kubeconfig(&self, host: &str, user: &str) -> Result<Kubeconfig> {
-        println!("{} Fetching kubeconfig...", "->".blue());
+        let running = format!("{} Fetching kubeconfig ... {}", "->".blue(), "∨".blue());
+        let success = format!("{} Fetching kubeconfig ... {}", "->".blue(), "OK".green());
+        let failure = format!("{} Fetching kubeconfig ... {}", "->".blue(), "FAILED".red());
 
         let temp_dir = tempfile::tempdir()?;
         let temp_kubeconfig = temp_dir.path().join("k3s.yaml");
         let temp_path_str = temp_kubeconfig.to_str().unwrap();
         let remote_temp = "/tmp/k3s.yaml";
 
-        RemoteExecutor::execute(
+        RemoteExecutor::execute_live(
             host,
             user,
             &format!(
                 "sudo cp /etc/rancher/k3s/k3s.yaml {} && sudo chmod 644 {}",
                 remote_temp, remote_temp
             ),
+            &running,
+            &success,
+            &failure,
         )
         .await?;
 
@@ -770,6 +775,7 @@ impl RemoteManager {
         node: &RemoteNodeConfig,
         user: &str,
         uninstall_cmd: &str,
+        purge_tailscale: bool,
     ) {
         let node_name = node.stable_name();
         let target = self
@@ -782,7 +788,7 @@ impl RemoteManager {
             });
 
         if let Ok(target) = target {
-            let tailscale_device_id = if cluster.tailscale_enabled() {
+            let tailscale_device_id = if purge_tailscale && cluster.tailscale_enabled() {
                 self.fetch_tailscale_device_id(&target, user).await
             } else {
                 None
@@ -796,7 +802,7 @@ impl RemoteManager {
             )
             .await;
 
-            if cluster.tailscale_enabled() {
+            if purge_tailscale && cluster.tailscale_enabled() {
                 let _ = RemoteExecutor::execute(&target, user, Self::tailscale_purge_cmd()).await;
 
                 if let Some(device_id) = tailscale_device_id {
@@ -1045,7 +1051,7 @@ impl ClusterManager for RemoteManager {
         Ok(())
     }
 
-    async fn down(&self, config: &DevpodConfig) -> Result<()> {
+    async fn down(&self, config: &DevpodConfig, purge_tailscale: bool) -> Result<()> {
         let cluster = self.remote_cluster(config)?;
 
         let user = cluster.user.as_deref().unwrap_or("root");
@@ -1073,6 +1079,7 @@ impl ClusterManager for RemoteManager {
                 &agent,
                 user,
                 "/usr/local/bin/k3s-agent-uninstall.sh",
+                purge_tailscale,
             )
             .await;
             println!("   {} Agent uninstalled & data purged", "OK".green());
@@ -1084,8 +1091,14 @@ impl ClusterManager for RemoteManager {
                 "->".blue(),
                 server.stable_name()
             );
-            self.uninstall_node(cluster, &server, user, "/usr/local/bin/k3s-uninstall.sh")
-                .await;
+            self.uninstall_node(
+                cluster,
+                &server,
+                user,
+                "/usr/local/bin/k3s-uninstall.sh",
+                purge_tailscale,
+            )
+            .await;
             println!("   {} Server uninstalled & data purged", "OK".green());
         }
 
