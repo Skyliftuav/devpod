@@ -105,6 +105,13 @@ impl StatusTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextUseTarget {
+    env_name: String,
+    provider: String,
+    kubectl_context: Option<String>,
+}
+
 fn k3d_context_name(config: &DevpodConfig) -> String {
     format!("k3d-{}", config.project.name)
 }
@@ -256,6 +263,75 @@ fn load_kubeconfig_for_context_output() -> Kubeconfig {
     }
 }
 
+fn resolve_context_use_target(
+    config: &DevpodConfig,
+    env_name: &str,
+    global: bool,
+    kubeconfig: &Kubeconfig,
+) -> Result<ContextUseTarget> {
+    let cluster = config.get_cluster(env_name).with_context(|| {
+        format!(
+            "Environment '{}' not found in config. Run 'devpod context list' to see available contexts.",
+            env_name
+        )
+    })?;
+
+    if !global {
+        return Ok(ContextUseTarget {
+            env_name: env_name.to_string(),
+            provider: cluster.provider.clone(),
+            kubectl_context: None,
+        });
+    }
+
+    let status_target = resolve_status_target(config, Some(env_name), None, kubeconfig)?;
+    let Some(context_name) = status_target.kubectl_context() else {
+        anyhow::bail!(
+            "Environment '{}' uses provider '{}', which does not have a managed kubectl context.",
+            env_name,
+            cluster.provider
+        );
+    };
+
+    Ok(ContextUseTarget {
+        env_name: env_name.to_string(),
+        provider: cluster.provider.clone(),
+        kubectl_context: Some(context_name.to_string()),
+    })
+}
+
+fn kubectl_use_context_args(context_name: &str) -> Vec<String> {
+    vec![
+        "config".to_string(),
+        "use-context".to_string(),
+        context_name.to_string(),
+    ]
+}
+
+async fn set_kubectl_current_context(env_name: &str, context_name: &str) -> Result<()> {
+    let args = kubectl_use_context_args(context_name);
+    let status = tokio::process::Command::new("kubectl")
+        .args(&args)
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Devpod context was saved as '{}', but kubectl global context was not changed to '{}'",
+                env_name, context_name
+            )
+        })?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Devpod context was saved as '{}', but kubectl global context was not changed to '{}'",
+            env_name,
+            context_name
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Subcommand)]
 enum ContextCommands {
     /// List all available contexts
@@ -264,6 +340,10 @@ enum ContextCommands {
     Use {
         /// Context/environment name
         env: String,
+
+        /// Also set kubectl's global current-context
+        #[arg(long)]
+        global: bool,
     },
     /// Show current active context
     Show,
@@ -710,22 +790,41 @@ expose = [
                     }
                 }
             }
-            ContextCommands::Use { env } => {
-                if let Some(cluster) = config.get_cluster(&env) {
-                    let mut state = state;
-                    state.active_environment = Some(env.clone());
-                    state.save(&cli.config)?;
-                    println!("{} Switched to context '{}'", "OK".green(), env);
-                    println!("   Provider: {}", cluster.provider.cyan());
+            ContextCommands::Use { env, global } => {
+                let strict_kubeconfig = if global {
+                    Some(util::kubeconfig::load_default_kubeconfig()?)
+                } else {
+                    None
+                };
+                let target = resolve_context_use_target(
+                    &config,
+                    &env,
+                    global,
+                    strict_kubeconfig.as_ref().unwrap_or(&Kubeconfig::default()),
+                )?;
 
-                    let kubeconfig = load_kubeconfig_for_context_output();
+                let mut state = state;
+                state.active_environment = Some(target.env_name.clone());
+                state.save(&cli.config)?;
+                println!("{} Switched to context '{}'", "OK".green(), target.env_name);
+                println!("   Provider: {}", target.provider.cyan());
+
+                if let Some(context_name) = target.kubectl_context.as_deref() {
+                    set_kubectl_current_context(&target.env_name, context_name).await?;
+                    println!(
+                        "   {} kubectl current-context set to '{}'",
+                        "OK".green(),
+                        context_name
+                    );
+                }
+
+                if let Some(cluster) = config.get_cluster(&target.env_name) {
+                    let kubeconfig =
+                        strict_kubeconfig.unwrap_or_else(load_kubeconfig_for_context_output);
                     println!(
                         "   {}",
-                        context_kube_status(&config, &env, cluster, &kubeconfig)
+                        context_kube_status(&config, &target.env_name, cluster, &kubeconfig)
                     );
-                } else {
-                    println!("{} Environment '{}' not found in config", "!".red(), env);
-                    std::process::exit(1);
                 }
             }
             ContextCommands::Show => {
@@ -1163,6 +1262,18 @@ mod tests {
         }
     }
 
+    fn k3d_cluster() -> ClusterDefinition {
+        ClusterDefinition {
+            provider: "k3d".to_string(),
+            connection: None,
+            user: None,
+            nodes: Vec::new(),
+            datastore_endpoint: None,
+            access: ClusterAccessConfig::default(),
+            tailscale: TailscaleConfig::default(),
+        }
+    }
+
     fn kubeconfig_with_context(name: &str) -> Kubeconfig {
         Kubeconfig {
             contexts: vec![ContextEntry {
@@ -1241,5 +1352,102 @@ mod tests {
 
         assert!(error.contains("Environment 'missing' not found"));
         assert!(error.contains("devpod context list"));
+    }
+
+    #[test]
+    fn context_use_default_does_not_require_kube_context() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = Kubeconfig::default();
+
+        let target = resolve_context_use_target(&config, "edge", false, &kubeconfig).unwrap();
+
+        assert_eq!(
+            target,
+            ContextUseTarget {
+                env_name: "edge".to_string(),
+                provider: "k3s".to_string(),
+                kubectl_context: None
+            }
+        );
+    }
+
+    #[test]
+    fn context_use_global_resolves_remote_env_to_managed_context() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = kubeconfig_with_context("devpod-edge-direct");
+
+        let target = resolve_context_use_target(&config, "edge", true, &kubeconfig).unwrap();
+
+        assert_eq!(
+            target,
+            ContextUseTarget {
+                env_name: "edge".to_string(),
+                provider: "k3s".to_string(),
+                kubectl_context: Some("devpod-edge-direct".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn context_use_global_fails_with_sync_guidance_when_context_is_missing() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = Kubeconfig::default();
+
+        let error = resolve_context_use_target(&config, "edge", true, &kubeconfig)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("devpod-edge-direct"));
+        assert!(error.contains("devpod sync-context --env edge"));
+    }
+
+    #[test]
+    fn context_use_unknown_env_fails_with_context_list_guidance() {
+        let config = test_config(HashMap::new());
+        let kubeconfig = Kubeconfig::default();
+
+        let error = resolve_context_use_target(&config, "missing", false, &kubeconfig)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Environment 'missing' not found"));
+        assert!(error.contains("devpod context list"));
+    }
+
+    #[test]
+    fn context_use_global_resolves_k3d_env_to_project_context() {
+        let mut clusters = HashMap::new();
+        clusters.insert("dev".to_string(), k3d_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = kubeconfig_with_context("k3d-edge-app");
+
+        let target = resolve_context_use_target(&config, "dev", true, &kubeconfig).unwrap();
+
+        assert_eq!(
+            target,
+            ContextUseTarget {
+                env_name: "dev".to_string(),
+                provider: "k3d".to_string(),
+                kubectl_context: Some("k3d-edge-app".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn kubectl_use_context_args_builds_expected_command_args() {
+        assert_eq!(
+            kubectl_use_context_args("devpod-edge-direct"),
+            vec![
+                "config".to_string(),
+                "use-context".to_string(),
+                "devpod-edge-direct".to_string()
+            ]
+        );
     }
 }

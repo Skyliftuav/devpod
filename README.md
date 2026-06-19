@@ -67,6 +67,12 @@ cargo install --path .
     ```
     Devpod stores this active environment in `.devpod/state.toml`. This does not change kubectl's global `current-context`.
 
+    To make plain `kubectl` follow the selected environment too, opt into the global side effect:
+    ```bash
+    devpod context use production-van --global
+    ```
+    This runs `kubectl config use-context <resolved-devpod-context>` after validating that the managed kube context exists.
+
 5.  **Refresh kubeconfig after reinitializing a remote cluster**:
     ```bash
     devpod sync-context --env production-van
