@@ -59,13 +59,21 @@ cargo install --path .
     devpod status
     ```
 
-4.  **Refresh kubeconfig after reinitializing a remote cluster**:
+4.  **Select a configured environment**:
+    ```bash
+    devpod context list
+    devpod context use production-van
+    devpod context show
+    ```
+    Devpod stores this active environment in `.devpod/state.toml`. This does not change kubectl's global `current-context`.
+
+5.  **Refresh kubeconfig after reinitializing a remote cluster**:
     ```bash
     devpod sync-context --env production-van
     ```
     This refreshes the local `devpod-<env>-tailnet`, `devpod-<env>-lan`, and `devpod-<env>-direct` contexts from the live remote `k3s` server without reprovisioning or redeploying.
 
-5.  **Shut down the environment**:
+6.  **Shut down the environment**:
     ```bash
     devpod down
     ```
@@ -160,6 +168,8 @@ Remote `k3s` provisioning now does the following:
 -   Installs and configures Tailscale when enabled, then generates a Tailscale kubeconfig context such as `devpod-production-van-tailnet`.
 -   Also generates a direct-address kubeconfig context such as `devpod-production-van-direct` so on-site management can still work even if MagicDNS or `.local` name resolution is unavailable.
 -   Makes the preferred context the primary access mode, usually Tailscale.
+
+When a remote environment is active, `devpod status` runs kubectl with the resolved managed context explicitly, for example `kubectl --context devpod-production-van-tailnet get nodes`. If that kube context is missing, run `devpod sync-context --env production-van`. Devpod will not silently fall back to kubectl's global `current-context`, because that can show the wrong cluster after switching environments.
 
 Set `TAILSCALE_AUTH_KEY` in your shell before running `devpod up` for a portable Tailscale-managed cluster.
 Set `TAILSCALE_API_KEY` as well if you want `devpod down` to delete the device from the Tailscale admin plane instead of only logging it out and purging the node locally.

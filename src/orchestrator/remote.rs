@@ -57,7 +57,7 @@ impl RemoteManager {
         format!("devpod-{}-{}", self.env_name, suffix)
     }
 
-    fn managed_context_names(&self) -> Vec<String> {
+    pub fn managed_context_names(&self) -> Vec<String> {
         vec![
             self.legacy_context_name(),
             self.context_name("tailnet"),
@@ -134,7 +134,11 @@ impl RemoteManager {
             .any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
     }
 
-    fn current_context_name(&self, cluster: &ClusterDefinition, primary: &RemoteNodeConfig) -> String {
+    fn current_context_name(
+        &self,
+        cluster: &ClusterDefinition,
+        primary: &RemoteNodeConfig,
+    ) -> String {
         let endpoints = self.endpoint_specs(cluster, primary);
 
         if let Some(endpoint) = endpoints
@@ -145,6 +149,32 @@ impl RemoteManager {
         }
 
         self.preferred_context_name(cluster, primary)
+    }
+
+    pub fn preferred_kube_context_name(&self, cluster: &ClusterDefinition) -> Result<String> {
+        if cluster.provider != "k3s" {
+            anyhow::bail!(
+                "Kube context resolution only supports remote k3s environments. '{}' uses provider '{}'",
+                self.env_name,
+                cluster.provider
+            );
+        }
+
+        let primary = self.primary_server(cluster)?;
+        Ok(self.preferred_context_name(cluster, primary))
+    }
+
+    pub fn resolved_kube_context_name(&self, cluster: &ClusterDefinition) -> Result<String> {
+        if cluster.provider != "k3s" {
+            anyhow::bail!(
+                "Kube context resolution only supports remote k3s environments. '{}' uses provider '{}'",
+                self.env_name,
+                cluster.provider
+            );
+        }
+
+        let primary = self.primary_server(cluster)?;
+        Ok(self.current_context_name(cluster, primary))
     }
 
     fn connection_candidates(
@@ -537,12 +567,18 @@ impl RemoteManager {
         })?;
 
         let response = reqwest::Client::new()
-            .delete(format!("https://api.tailscale.com/api/v2/device/{}", device_id))
+            .delete(format!(
+                "https://api.tailscale.com/api/v2/device/{}",
+                device_id
+            ))
             .basic_auth(api_key, Some(""))
             .send()
             .await
             .with_context(|| {
-                format!("Failed to call Tailscale API while deleting '{}'", node_name)
+                format!(
+                    "Failed to call Tailscale API while deleting '{}'",
+                    node_name
+                )
             })?;
 
         if !response.status().is_success() {
@@ -628,13 +664,10 @@ impl RemoteManager {
             "->".blue(),
             hostname
         );
-        let tailscale_status = RemoteExecutor::execute(
-            bootstrap,
-            user,
-            Self::tailscale_connected_check_cmd(),
-        )
-        .await
-        .unwrap_or_default();
+        let tailscale_status =
+            RemoteExecutor::execute(bootstrap, user, Self::tailscale_connected_check_cmd())
+                .await
+                .unwrap_or_default();
 
         if tailscale_status.trim() == "connected" {
             println!(
@@ -664,13 +697,10 @@ impl RemoteManager {
             );
         }
 
-        let tailscale_status = RemoteExecutor::execute(
-            bootstrap,
-            user,
-            Self::tailscale_connected_check_cmd(),
-        )
-        .await
-        .unwrap_or_default();
+        let tailscale_status =
+            RemoteExecutor::execute(bootstrap, user, Self::tailscale_connected_check_cmd())
+                .await
+                .unwrap_or_default();
 
         if tailscale_status.trim() != "connected" {
             let diagnostics = self.tailscale_debug_info(bootstrap, user).await;
@@ -1255,6 +1285,32 @@ mod tests {
         assert_eq!(endpoints[2].kind, EndpointKind::Direct);
         assert_eq!(endpoints[2].context_name, "devpod-edge-direct");
         assert_eq!(endpoints[2].server_host, "192.168.50.10");
+    }
+
+    #[test]
+    fn managed_context_names_include_legacy_and_endpoint_contexts() {
+        let manager = RemoteManager::new("edge");
+
+        assert_eq!(
+            manager.managed_context_names(),
+            vec![
+                "devpod-edge".to_string(),
+                "devpod-edge-tailnet".to_string(),
+                "devpod-edge-lan".to_string(),
+                "devpod-edge-direct".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn preferred_kube_context_name_uses_configured_primary_access() {
+        let manager = RemoteManager::new("edge");
+        let cluster = cluster();
+
+        assert_eq!(
+            manager.preferred_kube_context_name(&cluster).unwrap(),
+            "devpod-edge-tailnet"
+        );
     }
 
     #[test]

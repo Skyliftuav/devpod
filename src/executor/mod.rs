@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use colored::Colorize;
+use std::collections::VecDeque;
+use std::io::{self, Write};
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
-use std::collections::VecDeque;
-use std::io::{self, Write};
-use colored::Colorize;
 
 struct ConsolePanel {
     header: String,
@@ -77,7 +77,9 @@ impl ConsolePanel {
         }
 
         if let Some(ref line_content) = self.incomplete_line {
-            let clean = line_content.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+            let clean = line_content
+                .trim_end_matches(|c| c == '\n' || c == '\r')
+                .to_string();
             let inner_width = self.width - 2;
             let display_line = if clean.len() > inner_width {
                 format!("{}...", &clean[0..inner_width - 3])
@@ -94,7 +96,9 @@ impl ConsolePanel {
 
     fn add_line(&mut self, line: &str) {
         self.incomplete_line = None;
-        let clean_line = line.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+        let clean_line = line
+            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .to_string();
         for sub_line in clean_line.split('\n') {
             let parts: Vec<&str> = sub_line.split('\r').collect();
             if let Some(last_part) = parts.last() {
@@ -110,7 +114,9 @@ impl ConsolePanel {
     }
 
     fn add_line_incomplete(&mut self, line: &str) {
-        let clean_line = line.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+        let clean_line = line
+            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .to_string();
         let parts: Vec<&str> = clean_line.split(|c| c == '\n' || c == '\r').collect();
         if let Some(last_part) = parts.last() {
             if !last_part.is_empty() {
@@ -144,10 +150,10 @@ impl ConsolePanel {
                 let _ = write!(stdout, "\r\x1B[{}A", move_up);
             }
             let _ = write!(stdout, "\r\x1B[2K{}\n", final_header);
-            
+
             let red_top = format!("  ┌{}┐", "─".repeat(self.width)).red();
             let _ = write!(stdout, "\r\x1B[2K{}\n", red_top);
-            
+
             let mut all_lines = Vec::new();
             for line in &self.lines {
                 all_lines.push(line.clone());
@@ -157,13 +163,27 @@ impl ConsolePanel {
             }
 
             let total = all_lines.len();
-            let start = if total > self.height { total - self.height } else { 0 };
-            let pad = if total < self.height { self.height - total } else { 0 };
+            let start = if total > self.height {
+                total - self.height
+            } else {
+                0
+            };
+            let pad = if total < self.height {
+                self.height - total
+            } else {
+                0
+            };
 
             for _ in 0..pad {
                 let inner_width = self.width - 2;
                 let display_line = format!("{:width$}", "", width = inner_width);
-                let _ = write!(stdout, "\r\x1B[2K  {} {} {}\n", "│".red(), display_line.red(), "│".red());
+                let _ = write!(
+                    stdout,
+                    "\r\x1B[2K  {} {} {}\n",
+                    "│".red(),
+                    display_line.red(),
+                    "│".red()
+                );
             }
 
             for idx in start..total {
@@ -177,7 +197,7 @@ impl ConsolePanel {
                 let line_to_print = format!("  {} {} {}", "│".red(), display_line.red(), "│".red());
                 let _ = write!(stdout, "\r\x1B[2K{}\n", line_to_print);
             }
-            
+
             let red_bottom = format!("  └{}┘", "─".repeat(self.width)).red();
             let _ = write!(stdout, "\r\x1B[2K{}\n", red_bottom);
         }
@@ -186,13 +206,12 @@ impl ConsolePanel {
     }
 }
 
-
 fn command_summary(command: &str) -> String {
     let first_line = command.lines().next().unwrap_or("").trim();
     if first_line.starts_with("if ") || first_line.is_empty() {
         return "Running remote script".to_string();
     }
-    
+
     let mut parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() > 5 {
         parts.truncate(5);
@@ -210,7 +229,7 @@ impl RemoteExecutor {
         let running_header = format!("      * {} ... {}", summary, "∨".blue());
         let success_header = format!("      * {} ... {}", summary, "OK".green());
         let failure_header = format!("      * {} ... {}", summary, "FAILED".red());
-        
+
         Self::execute_live(
             host,
             user,
@@ -233,7 +252,14 @@ impl RemoteExecutor {
         let target = format!("{}@{}", user, host);
         let mut child = Command::new("ssh")
             .args(["-o", "ConnectTimeout=5"])
-            .args(["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/devpod-ssh-%r@%h-%p", "-o", "ControlPersist=60"])
+            .args([
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/devpod-ssh-%r@%h-%p",
+                "-o",
+                "ControlPersist=60",
+            ])
             .arg("-tt")
             .arg(&target)
             .arg(command)
@@ -251,7 +277,7 @@ impl RemoteExecutor {
 
         let mut accumulated_stdout = String::new();
         let mut accumulated_stderr = String::new();
-        
+
         let mut stdout_pending = String::new();
         let mut stderr_pending = String::new();
 
@@ -280,7 +306,7 @@ impl RemoteExecutor {
                             let s = String::from_utf8_lossy(&stdout_buf[..n]);
                             accumulated_stdout.push_str(&s);
                             stdout_pending.push_str(&s);
-                            
+
                             while let Some(pos) = stdout_pending.find('\n') {
                                 let line = stdout_pending[..pos].to_string();
                                 panel.add_line(&line);
@@ -308,7 +334,7 @@ impl RemoteExecutor {
                             let s = String::from_utf8_lossy(&stderr_buf[..n]);
                             accumulated_stderr.push_str(&s);
                             stderr_pending.push_str(&s);
-                            
+
                             while let Some(pos) = stderr_pending.find('\n') {
                                 let line = stderr_pending[..pos].to_string();
                                 panel.add_line(&line);
@@ -400,7 +426,14 @@ impl RemoteExecutor {
         let target = format!("{}@{}", user, host);
         let status = Command::new("ssh")
             .args(["-o", "ConnectTimeout=5"])
-            .args(["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/devpod-ssh-%r@%h-%p", "-o", "ControlPersist=60"])
+            .args([
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/devpod-ssh-%r@%h-%p",
+                "-o",
+                "ControlPersist=60",
+            ])
             .arg(&target)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

@@ -1,6 +1,6 @@
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use colored::Colorize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevpodConfig {
@@ -297,7 +297,9 @@ impl DevpodConfig {
 
         // Find parent directory of the config file
         let config_path = std::path::Path::new(path);
-        let base_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let base_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
 
         // Scan base_dir/clusters and base_dir/.devpod/clusters
         let dirs_to_scan = vec![
@@ -319,9 +321,11 @@ impl DevpodConfig {
                 for entry in std::fs::read_dir(dir)? {
                     let entry = entry?;
                     let file_path = entry.path();
-                    if file_path.is_file() && file_path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                    if file_path.is_file()
+                        && file_path.extension().and_then(|s| s.to_str()) == Some("toml")
+                    {
                         let file_content = std::fs::read_to_string(&file_path)?;
-                        
+
                         // Try parsing as multi-cluster wrapper first
                         let mut loaded = false;
                         if let Ok(multi) = toml::from_str::<MultiClusterFile>(&file_content) {
@@ -337,7 +341,9 @@ impl DevpodConfig {
                             // Otherwise try parsing as a single flat ClusterDefinition
                             match toml::from_str::<ClusterDefinition>(&file_content) {
                                 Ok(cluster_def) => {
-                                    if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
+                                    if let Some(stem) =
+                                        file_path.file_stem().and_then(|s| s.to_str())
+                                    {
                                         config.cluster.insert(stem.to_string(), cluster_def);
                                     }
                                 }
@@ -370,11 +376,16 @@ impl DevpodConfig {
         let mut config: DevpodConfig = toml::from_str(&content)?;
 
         if config.schema_version > 0 {
-            anyhow::bail!("Configuration is already migrated (schema_version = {})", config.schema_version);
+            anyhow::bail!(
+                "Configuration is already migrated (schema_version = {})",
+                config.schema_version
+            );
         }
 
         let config_path = std::path::Path::new(path);
-        let base_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let base_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let clusters_dir = base_dir.join("clusters");
         std::fs::create_dir_all(&clusters_dir)?;
 
@@ -382,7 +393,11 @@ impl DevpodConfig {
             let cluster_content = toml::to_string(cluster_def)?;
             let cluster_file = clusters_dir.join(format!("{}.toml", name));
             std::fs::write(cluster_file, cluster_content)?;
-            println!("  {} Migrated cluster context to clusters/{}.toml", "OK".green(), name);
+            println!(
+                "  {} Migrated cluster context to clusters/{}.toml",
+                "OK".green(),
+                name
+            );
         }
 
         // Update config to schema version 1 and clear the embedded cluster map
@@ -442,7 +457,7 @@ impl ClusterDefinition {
         if self.datastore_endpoint.is_none() {
             self.datastore_endpoint = defaults.datastore_endpoint.clone();
         }
-        
+
         // Merge access
         if self.access.mode == "dual" && defaults.access.mode != "dual" {
             self.access.mode = defaults.access.mode.clone();
@@ -464,10 +479,14 @@ impl ClusterDefinition {
         if self.tailscale.tailnet_domain.is_none() {
             self.tailscale.tailnet_domain = defaults.tailscale.tailnet_domain.clone();
         }
-        if self.tailscale.auth_key_env == "TAILSCALE_AUTH_KEY" && defaults.tailscale.auth_key_env != "TAILSCALE_AUTH_KEY" {
+        if self.tailscale.auth_key_env == "TAILSCALE_AUTH_KEY"
+            && defaults.tailscale.auth_key_env != "TAILSCALE_AUTH_KEY"
+        {
             self.tailscale.auth_key_env = defaults.tailscale.auth_key_env.clone();
         }
-        if self.tailscale.api_key_env == "TAILSCALE_API_KEY" && defaults.tailscale.api_key_env != "TAILSCALE_API_KEY" {
+        if self.tailscale.api_key_env == "TAILSCALE_API_KEY"
+            && defaults.tailscale.api_key_env != "TAILSCALE_API_KEY"
+        {
             self.tailscale.api_key_env = defaults.tailscale.api_key_env.clone();
         }
         if self.tailscale.tags.is_empty() {
@@ -489,7 +508,7 @@ impl DevpodState {
         let path = std::path::Path::new(config_path);
         let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let state_path = base_dir.join(".devpod").join("state.toml");
-        
+
         if let Ok(content) = std::fs::read_to_string(state_path) {
             if let Ok(state) = toml::from_str::<DevpodState>(&content) {
                 return state;
@@ -502,7 +521,7 @@ impl DevpodState {
         let path = std::path::Path::new(config_path);
         let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let devpod_dir = base_dir.join(".devpod");
-        
+
         std::fs::create_dir_all(&devpod_dir)?;
         let state_path = devpod_dir.join("state.toml");
         let content = toml::to_string(self)?;
@@ -650,7 +669,10 @@ mod tests {
         assert_eq!(cluster.access.mode, "tailscale-only"); // Merged access mode
         assert_eq!(cluster.access.lan_domain, "defaults.local"); // Merged lan domain
         assert!(cluster.tailscale.enabled); // Merged tailscale enabled
-        assert_eq!(cluster.tailscale.tailnet_domain, Some("defaults.ts.net".to_string())); // Merged tailnet
+        assert_eq!(
+            cluster.tailscale.tailnet_domain,
+            Some("defaults.ts.net".to_string())
+        ); // Merged tailnet
         assert_eq!(cluster.tailscale.auth_key_env, "TEST_AUTH_KEY"); // Merged auth key env
         assert_eq!(cluster.tailscale.api_key_env, "TEST_API_KEY"); // Merged api key env
         assert_eq!(cluster.tailscale.tags, vec!["tag:test".to_string()]); // Merged tags

@@ -1,5 +1,7 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Structures for kubeconfig merging
 
@@ -54,6 +56,42 @@ pub struct Kubeconfig {
     pub users: Vec<UserEntry>,
 }
 
+impl Kubeconfig {
+    pub fn has_context(&self, name: &str) -> bool {
+        self.contexts.iter().any(|context| context.name == name)
+    }
+
+    pub fn existing_contexts(&self, names: &[String]) -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| self.has_context(name))
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn default_kubeconfig_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("No home dir")?;
+    Ok(home.join(".kube").join("config"))
+}
+
+pub fn load_kubeconfig(path: impl AsRef<Path>) -> Result<Kubeconfig> {
+    let path = path.as_ref();
+
+    if !path.exists() {
+        return Ok(Kubeconfig::default());
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read kubeconfig at {}", path.display()))?;
+    serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse kubeconfig at {}", path.display()))
+}
+
+pub fn load_default_kubeconfig() -> Result<Kubeconfig> {
+    load_kubeconfig(default_kubeconfig_path()?)
+}
+
 /// Merge `incoming` kubeconfig into `base` kubeconfig.
 /// Updates existing entries by name, or appends new ones.
 pub fn merge_kubeconfig(base: &mut Kubeconfig, incoming: Kubeconfig) {
@@ -106,8 +144,10 @@ pub fn merge_kubeconfig(base: &mut Kubeconfig, incoming: Kubeconfig) {
 }
 
 pub fn remove_entries_by_name(base: &mut Kubeconfig, names: &[String]) {
-    base.clusters.retain(|cluster| !names.contains(&cluster.name));
-    base.contexts.retain(|context| !names.contains(&context.name));
+    base.clusters
+        .retain(|cluster| !names.contains(&cluster.name));
+    base.contexts
+        .retain(|context| !names.contains(&context.name));
     base.users.retain(|user| !names.contains(&user.name));
 
     if names.contains(&base.current_context) {
@@ -117,7 +157,7 @@ pub fn remove_entries_by_name(base: &mut Kubeconfig, names: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{remove_entries_by_name, Kubeconfig};
+    use super::{load_kubeconfig, remove_entries_by_name, Kubeconfig};
 
     #[test]
     fn remove_entries_by_name_prunes_only_matching_entries() {
@@ -160,5 +200,46 @@ current-context: devpod-devlab-tailnet
         assert_eq!(kubeconfig.users.len(), 1);
         assert_eq!(kubeconfig.users[0].name, "keep");
         assert!(kubeconfig.current_context.is_empty());
+    }
+
+    #[test]
+    fn kubeconfig_reports_existing_named_contexts() {
+        let kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Config
+contexts:
+  - name: devpod-edge-direct
+    context:
+      cluster: devpod-edge-direct
+      user: devpod-edge-direct
+  - name: unrelated
+    context:
+      cluster: unrelated
+      user: unrelated
+"#,
+        )
+        .unwrap();
+
+        assert!(kubeconfig.has_context("devpod-edge-direct"));
+        assert!(!kubeconfig.has_context("devpod-edge-tailnet"));
+        assert_eq!(
+            kubeconfig.existing_contexts(&[
+                "devpod-edge-tailnet".to_string(),
+                "devpod-edge-direct".to_string()
+            ]),
+            vec!["devpod-edge-direct".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_kubeconfig_returns_default_when_file_is_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing-config");
+
+        let loaded = load_kubeconfig(&missing_path).unwrap();
+
+        assert!(loaded.contexts.is_empty());
+        assert!(loaded.current_context.is_empty());
     }
 }

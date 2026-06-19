@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::io::Write;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod builder;
 mod config;
@@ -15,6 +15,7 @@ use config::{ClusterDefinition, DevpodConfig, RemoteNodeConfig};
 use executor::RemoteExecutor;
 use orchestrator::get_manager; // Use RemoteExecutor
 use orchestrator::remote::RemoteManager;
+use util::kubeconfig::Kubeconfig;
 
 /// Devpod: Edge Orchestrator
 #[derive(Parser)]
@@ -60,6 +61,199 @@ async fn resolve_node_host(
     RemoteExecutor::first_reachable(candidate_refs.iter().copied(), user)
         .await
         .or_else(|| node.bootstrap_address().map(str::to_string))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatusTarget {
+    Local {
+        label: String,
+        context_name: Option<String>,
+    },
+    Remote {
+        env_name: String,
+        context_name: String,
+    },
+}
+
+impl StatusTarget {
+    fn label(&self) -> &str {
+        match self {
+            StatusTarget::Local { label, .. } => label,
+            StatusTarget::Remote { env_name, .. } => env_name,
+        }
+    }
+
+    fn kubectl_context(&self) -> Option<&str> {
+        match self {
+            StatusTarget::Local { context_name, .. } => context_name.as_deref(),
+            StatusTarget::Remote { context_name, .. } => Some(context_name.as_str()),
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self {
+            StatusTarget::Local {
+                label,
+                context_name: Some(context_name),
+            } => format!("{} ({})", label, context_name),
+            StatusTarget::Local { label, .. } => label.clone(),
+            StatusTarget::Remote {
+                env_name,
+                context_name,
+            } => format!("{} ({})", env_name, context_name),
+        }
+    }
+}
+
+fn k3d_context_name(config: &DevpodConfig) -> String {
+    format!("k3d-{}", config.project.name)
+}
+
+fn resolve_status_target(
+    config: &DevpodConfig,
+    requested_env: Option<&str>,
+    active_env: Option<&str>,
+    kubeconfig: &Kubeconfig,
+) -> Result<StatusTarget> {
+    let Some(env_name) = requested_env.or(active_env) else {
+        return Ok(StatusTarget::Local {
+            label: "local".to_string(),
+            context_name: None,
+        });
+    };
+
+    let cluster = config.get_cluster(env_name).with_context(|| {
+        format!(
+            "Environment '{}' not found in config. Run 'devpod context list' to see available contexts.",
+            env_name
+        )
+    })?;
+
+    match cluster.provider.as_str() {
+        "k3s" => {
+            let manager = RemoteManager::new(env_name);
+            let context_name = manager.resolved_kube_context_name(cluster)?;
+
+            if !kubeconfig.has_context(&context_name) {
+                let existing = kubeconfig.existing_contexts(&manager.managed_context_names());
+                let existing_detail = if existing.is_empty() {
+                    "No managed kube contexts are present.".to_string()
+                } else {
+                    format!("Existing managed contexts: {}.", existing.join(", "))
+                };
+
+                anyhow::bail!(
+                    "Kube context '{}' for environment '{}' is not configured. {} Run `devpod sync-context --env {}` to refresh it.",
+                    context_name,
+                    env_name,
+                    existing_detail,
+                    env_name
+                );
+            }
+
+            Ok(StatusTarget::Remote {
+                env_name: env_name.to_string(),
+                context_name,
+            })
+        }
+        "k3d" => {
+            let context_name = k3d_context_name(config);
+            if !kubeconfig.has_context(&context_name) {
+                anyhow::bail!(
+                    "Kube context '{}' for local k3d environment '{}' is not configured. Run `devpod up --env {}` to create or refresh it.",
+                    context_name,
+                    env_name,
+                    env_name
+                );
+            }
+
+            Ok(StatusTarget::Local {
+                label: env_name.to_string(),
+                context_name: Some(context_name),
+            })
+        }
+        _ => Ok(StatusTarget::Local {
+            label: env_name.to_string(),
+            context_name: None,
+        }),
+    }
+}
+
+async fn run_kubectl_status(target: &StatusTarget) -> Result<()> {
+    let mut command = tokio::process::Command::new("kubectl");
+
+    if let Some(context_name) = target.kubectl_context() {
+        command.arg("--context").arg(context_name);
+    }
+
+    let status = command
+        .args(["get", "nodes"])
+        .status()
+        .await
+        .with_context(|| format!("Failed to run kubectl for {}", target.label()))?;
+
+    if !status.success() {
+        anyhow::bail!("kubectl get nodes failed for {}", target.display_name());
+    }
+
+    Ok(())
+}
+
+fn context_kube_status(
+    config: &DevpodConfig,
+    env_name: &str,
+    cluster: &ClusterDefinition,
+    kubeconfig: &Kubeconfig,
+) -> String {
+    match cluster.provider.as_str() {
+        "k3s" => {
+            let manager = RemoteManager::new(env_name);
+            let managed_contexts = manager.managed_context_names();
+            let existing = kubeconfig.existing_contexts(&managed_contexts);
+
+            match manager.preferred_kube_context_name(cluster) {
+                Ok(expected) if kubeconfig.has_context(&expected) => {
+                    format!("kube: ready ({})", expected)
+                }
+                Ok(expected) if existing.is_empty() => {
+                    format!(
+                        "kube: missing expected {} (run `devpod sync-context --env {}`)",
+                        expected, env_name
+                    )
+                }
+                Ok(expected) => {
+                    format!(
+                        "kube: partial, expected {} (present: {})",
+                        expected,
+                        existing.join(", ")
+                    )
+                }
+                Err(error) => format!("kube: invalid ({})", error),
+            }
+        }
+        "k3d" => {
+            let context_name = k3d_context_name(config);
+            if kubeconfig.has_context(&context_name) {
+                format!("kube: ready ({})", context_name)
+            } else {
+                format!(
+                    "kube: missing expected {} (run `devpod up --env {}`)",
+                    context_name, env_name
+                )
+            }
+        }
+        _ => "kube: unmanaged".to_string(),
+    }
+}
+
+fn load_kubeconfig_for_context_output() -> Kubeconfig {
+    match util::kubeconfig::load_default_kubeconfig() {
+        Ok(kubeconfig) => kubeconfig,
+        Err(error) => {
+            println!("{} Could not inspect kubeconfig: {}", "!".yellow(), error);
+            Kubeconfig::default()
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -317,7 +511,10 @@ expose = [
             }
             println!("{} Build and deploy complete.", "OK".green());
         }
-        Commands::Down { env, purge_tailscale } => {
+        Commands::Down {
+            env,
+            purge_tailscale,
+        } => {
             let resolved_env = env.as_deref().or(state.active_environment.as_deref());
             let manager = get_manager(&config, resolved_env);
             manager.down(&config, purge_tailscale).await?;
@@ -325,9 +522,9 @@ expose = [
         }
         Commands::SyncContext { env } => {
             let env_name = resolve_env(env)?;
-            let cluster = config.get_cluster(&env_name).with_context(|| {
-                format!("Environment '{}' not found in config", env_name)
-            })?;
+            let cluster = config
+                .get_cluster(&env_name)
+                .with_context(|| format!("Environment '{}' not found in config", env_name))?;
 
             if cluster.provider != "k3s" {
                 anyhow::bail!(
@@ -342,19 +539,21 @@ expose = [
             println!("{} Kubeconfig context refreshed.", "OK".green());
         }
         Commands::Status { env } => {
-            let resolved_env = env.as_deref().or(state.active_environment.as_deref());
+            let kubeconfig = util::kubeconfig::load_default_kubeconfig()?;
+            let target = resolve_status_target(
+                &config,
+                env.as_deref(),
+                state.active_environment.as_deref(),
+                &kubeconfig,
+            )?;
+
             println!(
                 "{} Checking status for {}...",
                 "->".blue(),
-                resolved_env.unwrap_or("local")
+                target.display_name()
             );
 
-            // Check node status using kubectl
-            let _ = tokio::process::Command::new("kubectl")
-                .arg("get")
-                .arg("nodes")
-                .status()
-                .await;
+            run_kubectl_status(&target).await?;
         }
         Commands::Nodes { env } => {
             let env_name = resolve_env(env)?;
@@ -378,7 +577,11 @@ expose = [
                     }
                 }
             } else {
-                println!("{} Environment '{}' not found in config", "!".red(), env_name);
+                println!(
+                    "{} Environment '{}' not found in config",
+                    "!".red(),
+                    env_name
+                );
             }
         }
         Commands::Ssh { env, node } => {
@@ -404,7 +607,11 @@ expose = [
             let env_name = resolve_env(env)?;
             if let Some(cluster) = config.get_cluster(&env_name) {
                 let user = cluster.user.as_deref().unwrap_or("root");
-                println!("{} Setting up nodes for '{}'...", "->".blue().bold(), env_name);
+                println!(
+                    "{} Setting up nodes for '{}'...",
+                    "->".blue().bold(),
+                    env_name
+                );
 
                 for node in &cluster.nodes {
                     let Some(host) = node.bootstrap_address() else {
@@ -430,8 +637,10 @@ expose = [
                     fi";
 
                     let running_cgroups = format!("      * Configuring cgroups ... {}", "∨".blue());
-                    let success_cgroups = format!("      * Configuring cgroups ... {}", "OK".green());
-                    let failure_cgroups = format!("      * Configuring cgroups ... {}", "FAILED".red());
+                    let success_cgroups =
+                        format!("      * Configuring cgroups ... {}", "OK".green());
+                    let failure_cgroups =
+                        format!("      * Configuring cgroups ... {}", "FAILED".red());
                     let _ = RemoteExecutor::execute_live(
                         host,
                         user,
@@ -444,9 +653,12 @@ expose = [
 
                     // 2. Install Dependencies (curl, etc)
                     let cmd_deps = "sudo apt-get update && sudo apt-get install -y curl unzip";
-                    let running_deps = format!("      * Installing dependencies ... {}", "∨".blue());
-                    let success_deps = format!("      * Installing dependencies ... {}", "OK".green());
-                    let failure_deps = format!("      * Installing dependencies ... {}", "FAILED".red());
+                    let running_deps =
+                        format!("      * Installing dependencies ... {}", "∨".blue());
+                    let success_deps =
+                        format!("      * Installing dependencies ... {}", "OK".green());
+                    let failure_deps =
+                        format!("      * Installing dependencies ... {}", "FAILED".red());
                     let _ = RemoteExecutor::execute_live(
                         host,
                         user,
@@ -467,58 +679,91 @@ expose = [
                     "OK".green()
                 );
             } else {
-                println!("{} Environment '{}' not found in config", "!".red(), env_name);
+                println!(
+                    "{} Environment '{}' not found in config",
+                    "!".red(),
+                    env_name
+                );
             }
         }
-        Commands::Context { command } => {
-            match command {
-                ContextCommands::List => {
-                    println!("Available contexts:");
-                    for cluster_name in config.cluster.keys() {
-                        let marker = if state.active_environment.as_ref() == Some(cluster_name) {
-                            "* ".green().bold()
-                        } else {
-                            "  ".normal()
-                        };
-                        println!("{}{}", marker, cluster_name);
+        Commands::Context { command } => match command {
+            ContextCommands::List => {
+                let kubeconfig = load_kubeconfig_for_context_output();
+                let mut cluster_names = config.cluster.keys().collect::<Vec<_>>();
+                cluster_names.sort();
+
+                println!("Available contexts:");
+                for cluster_name in cluster_names {
+                    let marker = if state.active_environment.as_ref() == Some(cluster_name) {
+                        "* ".green().bold()
+                    } else {
+                        "  ".normal()
+                    };
+                    if let Some(cluster) = config.get_cluster(cluster_name) {
+                        println!(
+                            "{}{} ({}) - {}",
+                            marker,
+                            cluster_name,
+                            cluster.provider,
+                            context_kube_status(&config, cluster_name, cluster, &kubeconfig)
+                        );
                     }
                 }
-                ContextCommands::Use { env } => {
-                    if config.cluster.contains_key(&env) {
-                        let mut state = state;
-                        state.active_environment = Some(env.clone());
-                        state.save(&cli.config)?;
-                        println!("{} Switched to context '{}'", "OK".green(), env);
+            }
+            ContextCommands::Use { env } => {
+                if let Some(cluster) = config.get_cluster(&env) {
+                    let mut state = state;
+                    state.active_environment = Some(env.clone());
+                    state.save(&cli.config)?;
+                    println!("{} Switched to context '{}'", "OK".green(), env);
+                    println!("   Provider: {}", cluster.provider.cyan());
+
+                    let kubeconfig = load_kubeconfig_for_context_output();
+                    println!(
+                        "   {}",
+                        context_kube_status(&config, &env, cluster, &kubeconfig)
+                    );
+                } else {
+                    println!("{} Environment '{}' not found in config", "!".red(), env);
+                    std::process::exit(1);
+                }
+            }
+            ContextCommands::Show => {
+                if let Some(ref env) = state.active_environment {
+                    println!("Current active context: {}", env.green().bold());
+                    if let Some(cluster) = config.get_cluster(env) {
+                        let kubeconfig = load_kubeconfig_for_context_output();
+                        println!("Provider: {}", cluster.provider.cyan());
+                        println!(
+                            "{}",
+                            context_kube_status(&config, env, cluster, &kubeconfig)
+                        );
                     } else {
-                        println!("{} Environment '{}' not found in config", "!".red(), env);
+                        println!(
+                            "{} Active context '{}' is not defined in config. Run `devpod repair` to reset it.",
+                            "!".yellow(),
+                            env
+                        );
+                    }
+                } else {
+                    println!("No active context set. (Defaulting to local provider)");
+                }
+            }
+        },
+        Commands::Config { command } => match command {
+            ConfigCommands::Migrate => {
+                println!("{} Migrating configuration...", "->".blue());
+                match DevpodConfig::migrate(&cli.config) {
+                    Ok(_) => {
+                        println!("{} Migration complete.", "OK".green());
+                    }
+                    Err(e) => {
+                        println!("{} Migration failed: {}", "!".red(), e);
                         std::process::exit(1);
                     }
                 }
-                ContextCommands::Show => {
-                    if let Some(ref env) = state.active_environment {
-                        println!("Current active context: {}", env.green().bold());
-                    } else {
-                        println!("No active context set. (Defaulting to local provider)");
-                    }
-                }
             }
-        }
-        Commands::Config { command } => {
-            match command {
-                ConfigCommands::Migrate => {
-                    println!("{} Migrating configuration...", "->".blue());
-                    match DevpodConfig::migrate(&cli.config) {
-                        Ok(_) => {
-                            println!("{} Migration complete.", "OK".green());
-                        }
-                        Err(e) => {
-                            println!("{} Migration failed: {}", "!".red(), e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-        }
+        },
         Commands::Doctor { env } => {
             let resolved_env = env.as_deref().or(state.active_environment.as_deref());
             run_doctor(&config, resolved_env).await?;
@@ -534,7 +779,10 @@ expose = [
 }
 
 async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()> {
-    println!("{} Running Devpod Edge Doctor diagnostics...", "->".blue().bold());
+    println!(
+        "{} Running Devpod Edge Doctor diagnostics...",
+        "->".blue().bold()
+    );
     let mut ok = true;
 
     // 1. Config version / check
@@ -593,21 +841,30 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                     match RemoteExecutor::execute(&target, user, "uname -a").await {
                         Ok(_) => {
                             println!("{}", "REACHABLE (SSH OK)".green());
-                            
+
                             // Check cgroups setup on the node
                             print!("    - Checking cgroups status on node ... ");
                             std::io::stdout().flush().unwrap();
                             let check_cgroups = "if grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt || grep -q 'cgroup_memory=1' /boot/cmdline.txt; then echo ok; else echo missing; fi";
                             match RemoteExecutor::execute(&target, user, check_cgroups).await {
-                                Ok(out) if out.trim() == "ok" => println!("{}", "CONFIGURED".green()),
+                                Ok(out) if out.trim() == "ok" => {
+                                    println!("{}", "CONFIGURED".green())
+                                }
                                 _ => {
-                                    println!("{}", "MISSING cgroups settings (needs setup)".yellow());
+                                    println!(
+                                        "{}",
+                                        "MISSING cgroups settings (needs setup)".yellow()
+                                    );
                                     ok = false;
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("{} (SSH error: {})", "UNREACHABLE".red(), e.to_string().trim());
+                            println!(
+                                "{} (SSH error: {})",
+                                "UNREACHABLE".red(),
+                                e.to_string().trim()
+                            );
                             ok = false;
                         }
                     }
@@ -617,7 +874,11 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                 }
             }
         } else {
-            println!("  * {} Target environment '{}' is not defined in config", "!".red(), env);
+            println!(
+                "  * {} Target environment '{}' is not defined in config",
+                "!".red(),
+                env
+            );
             ok = false;
         }
     } else {
@@ -676,7 +937,10 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
 
     println!("\n=== DIAGNOSTIC SUMMARY ===");
     if ok {
-        println!("{} All checks passed! Your environment is healthy.", "SUCCESS".green().bold());
+        println!(
+            "{} All checks passed! Your environment is healthy.",
+            "SUCCESS".green().bold()
+        );
     } else {
         println!("{} Diagnostics found issues. Run 'devpod repair' to automatically fix repairable issues.", "WARNING".yellow().bold());
     }
@@ -684,12 +948,19 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
     Ok(())
 }
 
-async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&str>) -> Result<()> {
+async fn run_repair(
+    config: &DevpodConfig,
+    config_path: &str,
+    env_name: Option<&str>,
+) -> Result<()> {
     println!("{} Starting Devpod Edge Auto-Repair...", "->".blue().bold());
 
     // 1. Repair config version if version 0
     if config.schema_version == 0 {
-        println!("{} Legacy configuration schema (version 0) detected.", "->".yellow());
+        println!(
+            "{} Legacy configuration schema (version 0) detected.",
+            "->".yellow()
+        );
         print!("  * Attempting to migrate config ... ");
         std::io::stdout().flush().unwrap();
         match DevpodConfig::migrate(config_path) {
@@ -705,7 +976,11 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
     let state = config::DevpodState::load(config_path);
     if let Some(ref env) = state.active_environment {
         if !config.cluster.contains_key(env) {
-            println!("{} Active context '{}' points to a missing cluster.", "->".yellow(), env);
+            println!(
+                "{} Active context '{}' points to a missing cluster.",
+                "->".yellow(),
+                env
+            );
             print!("  * Resetting active context to default/local ... ");
             std::io::stdout().flush().unwrap();
             let mut state = state;
@@ -720,7 +995,7 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
         if let Some(cluster) = config.get_cluster(env) {
             if cluster.provider == "k3s" {
                 println!("{} Remote K3s environment '{}' detected.", "->".blue(), env);
-                
+
                 // Let's check node reachability and perform setup/repair
                 let user = cluster.user.as_deref().unwrap_or("root");
                 for node in &cluster.nodes {
@@ -729,13 +1004,17 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
                     if let Some(target) = resolve_node_host(cluster, node, user).await {
                         // Check if cgroups or deps need repair
                         let check_cgroups = "if grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt || grep -q 'cgroup_memory=1' /boot/cmdline.txt; then echo ok; else echo missing; fi";
-                        let cgroups_ok = match RemoteExecutor::execute(&target, user, check_cgroups).await {
-                            Ok(out) => out.trim() == "ok",
-                            _ => false,
-                        };
+                        let cgroups_ok =
+                            match RemoteExecutor::execute(&target, user, check_cgroups).await {
+                                Ok(out) => out.trim() == "ok",
+                                _ => false,
+                            };
 
                         if !cgroups_ok {
-                            println!("    - {} Node needs cgroups and dependency setup.", "->".yellow());
+                            println!(
+                                "    - {} Node needs cgroups and dependency setup.",
+                                "->".yellow()
+                            );
                             println!("    - Running setup for this node ... ");
                             let cmd_cgroups = "if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then 
                                 sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
@@ -746,9 +1025,12 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
                             else
                                 echo 'Cgroups already configured'
                             fi";
-                            let running_cgroups = format!("      * Configuring cgroups ... {}", "∨".blue());
-                            let success_cgroups = format!("      * Configuring cgroups ... {}", "OK".green());
-                            let failure_cgroups = format!("      * Configuring cgroups ... {}", "FAILED".red());
+                            let running_cgroups =
+                                format!("      * Configuring cgroups ... {}", "∨".blue());
+                            let success_cgroups =
+                                format!("      * Configuring cgroups ... {}", "OK".green());
+                            let failure_cgroups =
+                                format!("      * Configuring cgroups ... {}", "FAILED".red());
                             let _ = RemoteExecutor::execute_live(
                                 &target,
                                 user,
@@ -759,10 +1041,14 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
                             )
                             .await;
 
-                            let cmd_deps = "sudo apt-get update && sudo apt-get install -y curl unzip";
-                            let running_deps = format!("      * Installing curl and unzip ... {}", "∨".blue());
-                            let success_deps = format!("      * Installing curl and unzip ... {}", "OK".green());
-                            let failure_deps = format!("      * Installing curl and unzip ... {}", "FAILED".red());
+                            let cmd_deps =
+                                "sudo apt-get update && sudo apt-get install -y curl unzip";
+                            let running_deps =
+                                format!("      * Installing curl and unzip ... {}", "∨".blue());
+                            let success_deps =
+                                format!("      * Installing curl and unzip ... {}", "OK".green());
+                            let failure_deps =
+                                format!("      * Installing curl and unzip ... {}", "FAILED".red());
                             let _ = RemoteExecutor::execute_live(
                                 &target,
                                 user,
@@ -773,7 +1059,10 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
                             )
                             .await;
 
-                            println!("      * {} Rebooting node to apply cgroups changes ... ", "->".yellow());
+                            println!(
+                                "      * {} Rebooting node to apply cgroups changes ... ",
+                                "->".yellow()
+                            );
                             let _ = RemoteExecutor::execute(&target, user, "sudo reboot").await;
                         } else {
                             println!("    - {}", "Node requirements are healthy".green());
@@ -793,7 +1082,10 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
             }
         }
     } else {
-        println!("{} Repair running on local context. Checking Docker daemon...", "->".blue());
+        println!(
+            "{} Repair running on local context. Checking Docker daemon...",
+            "->".blue()
+        );
         match tokio::process::Command::new("docker")
             .arg("info")
             .stdout(std::process::Stdio::null())
@@ -814,3 +1106,140 @@ async fn run_repair(config: &DevpodConfig, config_path: &str, env_name: Option<&
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        ClusterAccessConfig, DeploymentConfig, InfrastructureConfig, NetworkConfig, ProjectConfig,
+        RegistryConfig, SecretsConfig, TailscaleConfig,
+    };
+    use crate::util::kubeconfig::{ContextEntry, ContextRef};
+    use std::collections::HashMap;
+
+    fn test_config(clusters: HashMap<String, ClusterDefinition>) -> DevpodConfig {
+        DevpodConfig {
+            schema_version: 1,
+            project: ProjectConfig {
+                name: "edge-app".to_string(),
+            },
+            provider: None,
+            cluster: clusters,
+            cluster_defaults: None,
+            registry: RegistryConfig::default(),
+            infrastructure: InfrastructureConfig {
+                persistent_storage_enabled: false,
+                data_mount_path: "/tmp/devpod-test".to_string(),
+            },
+            deployment: DeploymentConfig {
+                tool: "sailr".to_string(),
+                environment: "test".to_string(),
+            },
+            network: NetworkConfig::default(),
+            secrets: SecretsConfig::default(),
+        }
+    }
+
+    fn remote_cluster() -> ClusterDefinition {
+        ClusterDefinition {
+            provider: "k3s".to_string(),
+            connection: Some("ssh".to_string()),
+            user: Some("root".to_string()),
+            nodes: vec![RemoteNodeConfig {
+                role: "server".to_string(),
+                name: Some("control-1".to_string()),
+                bootstrap_address: Some("127.0.0.1".to_string()),
+                address: None,
+                runtime: "containerd".to_string(),
+                labels: HashMap::new(),
+            }],
+            datastore_endpoint: None,
+            access: ClusterAccessConfig {
+                mode: "tailscale-only".to_string(),
+                primary: "tailscale".to_string(),
+                lan_domain: "local".to_string(),
+                published_ports: Vec::new(),
+            },
+            tailscale: TailscaleConfig::default(),
+        }
+    }
+
+    fn kubeconfig_with_context(name: &str) -> Kubeconfig {
+        Kubeconfig {
+            contexts: vec![ContextEntry {
+                name: name.to_string(),
+                context: ContextRef {
+                    cluster: name.to_string(),
+                    user: name.to_string(),
+                    data: HashMap::new(),
+                },
+            }],
+            ..Kubeconfig::default()
+        }
+    }
+
+    #[test]
+    fn status_resolves_active_remote_env_to_managed_context() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = kubeconfig_with_context("devpod-edge-direct");
+
+        let target = resolve_status_target(&config, None, Some("edge"), &kubeconfig).unwrap();
+
+        assert_eq!(
+            target,
+            StatusTarget::Remote {
+                env_name: "edge".to_string(),
+                context_name: "devpod-edge-direct".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn status_reports_sync_guidance_when_remote_kube_context_is_missing() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = Kubeconfig::default();
+
+        let error = resolve_status_target(&config, None, Some("edge"), &kubeconfig)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("devpod-edge-direct"));
+        assert!(error.contains("devpod sync-context --env edge"));
+    }
+
+    #[test]
+    fn status_explicit_env_overrides_active_env() {
+        let mut clusters = HashMap::new();
+        clusters.insert("edge".to_string(), remote_cluster());
+        clusters.insert("other".to_string(), remote_cluster());
+        let config = test_config(clusters);
+        let kubeconfig = kubeconfig_with_context("devpod-other-direct");
+
+        let target =
+            resolve_status_target(&config, Some("other"), Some("edge"), &kubeconfig).unwrap();
+
+        assert_eq!(
+            target,
+            StatusTarget::Remote {
+                env_name: "other".to_string(),
+                context_name: "devpod-other-direct".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn status_unknown_env_fails_with_context_list_guidance() {
+        let config = test_config(HashMap::new());
+        let kubeconfig = Kubeconfig::default();
+
+        let error = resolve_status_target(&config, Some("missing"), None, &kubeconfig)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Environment 'missing' not found"));
+        assert!(error.contains("devpod context list"));
+    }
+}
