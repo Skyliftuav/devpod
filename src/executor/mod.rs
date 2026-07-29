@@ -224,6 +224,40 @@ fn command_summary(command: &str) -> String {
 pub struct RemoteExecutor;
 
 impl RemoteExecutor {
+    pub async fn run_interactive(program: &str, args: &[String]) -> Result<()> {
+        let status = Command::new(program)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("Failed to spawn {}", program))?;
+
+        if !status.success() {
+            anyhow::bail!("{} exited with error", program);
+        }
+
+        Ok(())
+    }
+
+    pub async fn ssh_interactive(host: &str, user: &str, command: &str) -> Result<()> {
+        let target = format!("{}@{}", user, host);
+        let args = vec![
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+            "-tt".to_string(),
+            target.clone(),
+            command.to_string(),
+        ];
+
+        Self::run_interactive("ssh", &args)
+            .await
+            .with_context(|| format!("Interactive SSH command failed on {}", target))
+    }
+
     pub async fn execute(host: &str, user: &str, command: &str) -> Result<String> {
         let summary = command_summary(command);
         let running_header = format!("      * {} ... {}", summary, "∨".blue());

@@ -73,13 +73,19 @@ cargo install --path .
     ```
     This runs `kubectl config use-context <resolved-devpod-context>` after validating that the managed kube context exists.
 
-5.  **Refresh kubeconfig after reinitializing a remote cluster**:
+5.  **Initialize remote nodes for first contact**:
+    ```bash
+    devpod init-nodes --env production-van
+    ```
+    This copies your SSH key with `ssh-copy-id`, configures passwordless sudo for the configured cluster user, and installs safe baseline prerequisites. Use `--node <ref>` to initialize selected nodes and `--identity <path>` to choose a specific public key.
+
+6.  **Refresh kubeconfig after reinitializing a remote cluster**:
     ```bash
     devpod sync-context --env production-van
     ```
     This refreshes the local `devpod-<env>-tailnet`, `devpod-<env>-lan`, and `devpod-<env>-direct` contexts from the live remote `k3s` server without reprovisioning or redeploying.
 
-6.  **Shut down the environment**:
+7.  **Shut down the environment**:
     ```bash
     devpod down
     ```
@@ -169,6 +175,7 @@ environment = "edge-production"
 
 Remote `k3s` provisioning now does the following:
 
+-   `devpod init-nodes --env <env>` handles first-contact SSH key copy, dedicated passwordless sudo setup, and safe baseline packages before provisioning.
 -   Uses `bootstrap_address` for first contact and cluster joins on the local network.
 -   Sets a stable node hostname from `nodes[].name`, enables Avahi, and generates a LAN kubeconfig context such as `devpod-production-van-lan`.
 -   Installs and configures Tailscale when enabled, then generates a Tailscale kubeconfig context such as `devpod-production-van-tailnet`.

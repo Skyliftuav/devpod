@@ -7,12 +7,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod builder;
 mod config;
 mod executor;
+mod initializer;
 mod orchestrator; // Add executor module
 mod util;
 
 use builder::Builder;
 use config::{ClusterDefinition, DevpodConfig, RemoteNodeConfig};
 use executor::RemoteExecutor;
+use initializer::{run_init_nodes, tailscale_command_candidates};
 use orchestrator::get_manager; // Use RemoteExecutor
 use orchestrator::remote::RemoteManager;
 use util::kubeconfig::Kubeconfig;
@@ -61,6 +63,23 @@ async fn resolve_node_host(
     RemoteExecutor::first_reachable(candidate_refs.iter().copied(), user)
         .await
         .or_else(|| node.bootstrap_address().map(str::to_string))
+}
+
+async fn local_tailscale_command_succeeds(args: &[&str]) -> bool {
+    for candidate in tailscale_command_candidates(args) {
+        match tokio::process::Command::new(&candidate.program)
+            .args(&candidate.args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +418,26 @@ enum Commands {
         /// Target environment
         #[arg(long)]
         env: Option<String>,
+    },
+
+    /// First-contact bootstrap for remote nodes
+    #[command(
+        name = "init-nodes",
+        alias = "initialise-nodes",
+        alias = "bootstrap-nodes"
+    )]
+    InitNodes {
+        /// Target environment
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Node ref to initialize; repeat to select multiple nodes
+        #[arg(long = "node")]
+        node: Vec<String>,
+
+        /// Public key path passed to ssh-copy-id
+        #[arg(long)]
+        identity: Option<std::path::PathBuf>,
     },
 
     /// Check status
@@ -766,6 +805,14 @@ expose = [
                 );
             }
         }
+        Commands::InitNodes {
+            env,
+            node,
+            identity,
+        } => {
+            let env_name = resolve_env(env)?;
+            run_init_nodes(&config, &env_name, &node, identity.as_ref()).await?;
+        }
         Commands::Context { command } => match command {
             ContextCommands::List => {
                 let kubeconfig = load_kubeconfig_for_context_output();
@@ -898,7 +945,6 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
     let deps = vec![
         ("kubectl", vec!["version", "--client"]),
         ("ssh", vec!["-V"]),
-        ("tailscale", vec!["version"]),
     ];
     for (dep, args) in deps {
         print!("  * Checking {} ... ", dep);
@@ -918,6 +964,14 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                 ok = false;
             }
         }
+    }
+    print!("  * Checking tailscale ... ");
+    std::io::stdout().flush().unwrap();
+    if local_tailscale_command_succeeds(&["status", "--json"]).await {
+        println!("{}", "FOUND".green());
+    } else {
+        println!("{}", "MISSING or ERROR".red());
+        ok = false;
     }
 
     // 3. Context & active cluster resolve
@@ -941,6 +995,20 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                         Ok(_) => {
                             println!("{}", "REACHABLE (SSH OK)".green());
 
+                            print!("    - Checking passwordless sudo ... ");
+                            std::io::stdout().flush().unwrap();
+                            match RemoteExecutor::execute(&target, user, "sudo -n true").await {
+                                Ok(_) => println!("{}", "CONFIGURED".green()),
+                                Err(_) => {
+                                    println!(
+                                        "{}",
+                                        format!("MISSING (run `devpod init-nodes --env {}`)", env)
+                                            .yellow()
+                                    );
+                                    ok = false;
+                                }
+                            }
+
                             // Check cgroups setup on the node
                             print!("    - Checking cgroups status on node ... ");
                             std::io::stdout().flush().unwrap();
@@ -963,6 +1031,10 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                                 "{} (SSH error: {})",
                                 "UNREACHABLE".red(),
                                 e.to_string().trim()
+                            );
+                            println!(
+                                "    - {}",
+                                format!("Run `devpod init-nodes --env {}` to copy SSH keys and configure sudo.", env).yellow()
                             );
                             ok = false;
                         }
@@ -1011,20 +1083,11 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                 println!("  * Tailscale integration: {}", "ENABLED".green());
                 print!("  * Local tailscale status ... ");
                 std::io::stdout().flush().unwrap();
-                match tokio::process::Command::new("tailscale")
-                    .arg("status")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await
-                {
-                    Ok(status) if status.success() => {
-                        println!("{}", "CONNECTED".green());
-                    }
-                    _ => {
-                        println!("{}", "DISCONNECTED (Run 'tailscale up')".yellow());
-                        ok = false;
-                    }
+                if local_tailscale_command_succeeds(&["status", "--json"]).await {
+                    println!("{}", "CONNECTED".green());
+                } else {
+                    println!("{}", "DISCONNECTED (Run 'tailscale up')".yellow());
+                    ok = false;
                 }
             } else {
                 println!("  * Tailscale integration: {}", "DISABLED".yellow());
