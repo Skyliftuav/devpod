@@ -1,32 +1,15 @@
-# Devpod
+---
+name: devpod-usage
+description: Provides comprehensive instructions and commands on how to run, configure, manage, and troubleshoot devpod environments (including k3d/k3s, remote node initialization, and tailscale integration).
+---
 
-Devpod is a local edge development orchestrator. It runs Kubernetes-based applications on edge devices (such as ships, vans, or remote servers) using the same workflow as your local machine.
+# Devpod Usage Skill & End-to-End Setup Guide
 
-It integrates `sailr` with a local Kubernetes cluster (`k3d` or `k3s`) to provide a unified workflow for building, packaging, and deploying applications in both connected and offline environments.
+This skill guides you on how to use `devpod`, a local edge development orchestrator. Use this guide to walk users through setting up a devpod cluster from start to finish—including configuration, node initialization, boot-level setups, provisioning, and context management.
 
 ---
 
-## Features
-
-- **Hybrid Orchestrator**: Automatically detects your OS. On **Linux**, it manages a native `k3s` process. On **macOS/Windows**, it provisions a containerized `k3d` cluster.
-- **Simple Commands**: Provides straightforward basic commands. `devpod up` to start and `devpod down` to stop, abstracting away manual cluster management.
-- **Unified Workflow**: Uses the same configuration for local development and production deployment, reducing consistency issues.
-- **Sailr Powered**: Uses `sailr` for builds and templating.
-- **Portable Remote Access**: Remote `k3s` environments can publish stable LAN and Tailscale management endpoints so the same cluster can move between networks without rewriting kubeconfig.
-
----
-
-## Prerequisites
-
-Depending on your operating system, install the following on your local machine:
-
-- [Docker](https://www.docker.com/) (required for building images and running local containerized `k3d` clusters)
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) (Kubernetes client CLI)
-- [`sailr`](https://github.com/Adriftdev/sailr) (required for building and generating manifests)
-
----
-
-## End-to-End Cluster Setup Guide
+## Complete End-to-End Setup Guide
 
 Setting up an edge-development cluster with `devpod` follows a structured 6-step lifecycle:
 
@@ -41,20 +24,22 @@ graph TD
 
 ### Step 1: Install & Configure Devpod
 
+Before starting, install the required prerequisites on your local machine:
+- **Docker**: Required for building images and running local containerized clusters.
+- **kubectl**: Kubernetes CLI tool.
+- **sailr**: Build and packaging tool.
+
 1. **Build and Install Devpod**:
    Clone the repository and install it locally using Cargo:
-
    ```bash
    cargo install --path .
    ```
 
 2. **Initialize a Project Configuration**:
    Create a new project workspace by running:
-
    ```bash
    devpod init --name my-edge-cluster
    ```
-
    This generates a boilerplate `devpod.toml` file in the current directory.
 
 3. **Configure Your Cluster Nodes**:
@@ -105,12 +90,10 @@ Before devpod can orchestrate nodes over SSH, it needs passwordless SSH key acce
 
 1. **Run Node Initialization**:
    Execute the following command to make first contact with all nodes in your environment:
-
    ```bash
    devpod init-nodes --env production-van
    ```
-
-   _Optional parameters:_ Use `--node <node-name>` to target a single node, or `--identity <path>` to choose a specific public key.
+   *Optional parameters:* Use `--node <node-name>` to target a single node, or `--identity <path>` to choose a specific public key.
 
 2. **What Happens Under the Hood**:
    - Runs `ssh-copy-id` to copy your public SSH key to each node's `bootstrap_address`.
@@ -125,7 +108,6 @@ Kubernetes (K3s) requires `cpuset` and `memory` cgroup controllers enabled at th
 
 1. **Apply Boot Configuration**:
    Configure the necessary boot/kernel flags by running:
-
    ```bash
    devpod setup --env production-van
    ```
@@ -146,14 +128,12 @@ With key access and cgroups configured, you are ready to provision the Kubernete
 
 1. **Set Environment Keys (If using Tailscale)**:
    Ensure your Tailscale pre-authenticated node authorization key is exported in your environment:
-
    ```bash
    export TAILSCALE_AUTH_KEY="tskey-auth-..."
    ```
 
 2. **Bring the Cluster Up**:
    Run the startup command:
-
    ```bash
    devpod up --env production-van
    ```
@@ -177,11 +157,9 @@ Once provisioned, you can query and control your cluster.
 
 1. **Check Node and Cluster Status**:
    Verify everything is healthy:
-
    ```bash
    devpod status --env production-van
    ```
-
    This command directly queries your nodes to check status, verify boot flags on disk, and print cluster metrics.
 
 2. **Examine and Manage Contexts**:
@@ -194,13 +172,11 @@ Once provisioned, you can query and control your cluster.
      devpod context show
      ```
    - Switch active environment context:
-
      ```bash
      devpod context use production-van
      ```
-
-     _Note: Devpod stores context state in `.devpod/state.toml` rather than mutating your global kubectl config._
-
+     *Note: Devpod stores context state in `.devpod/state.toml` rather than mutating your global kubectl config.*
+   
    - If you want your main terminal shell's `kubectl` command to automatically follow your selected devpod context:
      ```bash
      devpod context use production-van --global
@@ -220,7 +196,6 @@ To release resources or clean up your development setup:
 
 1. **Set Admin Keys (Optional)**:
    If you want devpod to automatically delete the devices from your Tailscale Admin plane, export your API key:
-
    ```bash
    export TAILSCALE_API_KEY="tskey-api-..."
    ```
@@ -231,9 +206,3 @@ To release resources or clean up your development setup:
    devpod down --env production-van
    ```
    This logs out of the remote cluster, uninstalls K3s, and cleans up configured files.
-
----
-
-## Contributing
-
-Contributions are welcome. Please open an issue or submit a pull request if you find a bug or have a suggestion to improve the tool.
