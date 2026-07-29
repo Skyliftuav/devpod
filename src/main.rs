@@ -745,14 +745,30 @@ expose = [
                     println!("{} Configuring Node: {}", "->".blue(), host);
 
                     // 1. Enable cgroups for Docker/K3s compatibility
-                    let cmd_cgroups = "if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then 
-                        sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
-                        echo 'Updated /boot/firmware/cmdline.txt'
-                    elif ! grep -q 'cgroup_memory=1' /boot/cmdline.txt; then
-                        sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
-                         echo 'Updated /boot/cmdline.txt'
+                    let cmd_cgroups = "if [ -f /boot/firmware/cmdline.txt ]; then
+                        if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then
+                            sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
+                            echo 'Updated /boot/firmware/cmdline.txt'
+                        else
+                            echo 'Cgroups already configured in /boot/firmware/cmdline.txt'
+                        fi
+                    elif [ -f /boot/cmdline.txt ]; then
+                        if ! grep -q 'cgroup_memory=1' /boot/cmdline.txt; then
+                            sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
+                            echo 'Updated /boot/cmdline.txt'
+                        else
+                            echo 'Cgroups already configured in /boot/cmdline.txt'
+                        fi
+                    elif [ -f /boot/extlinux/extlinux.conf ]; then
+                        if ! grep -q 'cgroup_memory=1' /boot/extlinux/extlinux.conf; then
+                            sudo sed -i '/^APPEND/ s/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' /boot/extlinux/extlinux.conf
+                            echo 'Updated /boot/extlinux/extlinux.conf'
+                        else
+                            echo 'Cgroups already configured in /boot/extlinux/extlinux.conf'
+                        fi
                     else
-                        echo 'Cgroups already configured'
+                        echo 'No supported boot configuration file found'
+                        exit 1
                     fi";
 
                     let running_cgroups = format!("      * Configuring cgroups ... {}", "∨".blue());
@@ -1012,7 +1028,7 @@ async fn run_doctor(config: &DevpodConfig, env_name: Option<&str>) -> Result<()>
                             // Check cgroups setup on the node
                             print!("    - Checking cgroups status on node ... ");
                             std::io::stdout().flush().unwrap();
-                            let check_cgroups = "if grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt || grep -q 'cgroup_memory=1' /boot/cmdline.txt; then echo ok; else echo missing; fi";
+                            let check_cgroups = "if ( [ -f /boot/firmware/cmdline.txt ] && grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt ) || ( [ -f /boot/cmdline.txt ] && grep -q 'cgroup_memory=1' /boot/cmdline.txt ) || ( [ -f /boot/extlinux/extlinux.conf ] && grep -q 'cgroup_memory=1' /boot/extlinux/extlinux.conf ); then echo ok; else echo missing; fi";
                             match RemoteExecutor::execute(&target, user, check_cgroups).await {
                                 Ok(out) if out.trim() == "ok" => {
                                     println!("{}", "CONFIGURED".green())
@@ -1165,7 +1181,7 @@ async fn run_repair(
                     println!("  * Checking Node: {} ... ", node_name.cyan());
                     if let Some(target) = resolve_node_host(cluster, node, user).await {
                         // Check if cgroups or deps need repair
-                        let check_cgroups = "if grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt || grep -q 'cgroup_memory=1' /boot/cmdline.txt; then echo ok; else echo missing; fi";
+                        let check_cgroups = "if ( [ -f /boot/firmware/cmdline.txt ] && grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt ) || ( [ -f /boot/cmdline.txt ] && grep -q 'cgroup_memory=1' /boot/cmdline.txt ) || ( [ -f /boot/extlinux/extlinux.conf ] && grep -q 'cgroup_memory=1' /boot/extlinux/extlinux.conf ); then echo ok; else echo missing; fi";
                         let cgroups_ok =
                             match RemoteExecutor::execute(&target, user, check_cgroups).await {
                                 Ok(out) => out.trim() == "ok",
@@ -1178,15 +1194,31 @@ async fn run_repair(
                                 "->".yellow()
                             );
                             println!("    - Running setup for this node ... ");
-                            let cmd_cgroups = "if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then 
-                                sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
-                                echo 'Updated /boot/firmware/cmdline.txt'
-                            elif ! grep -q 'cgroup_memory=1' /boot/cmdline.txt; then
-                                sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
-                                 echo 'Updated /boot/cmdline.txt'
-                            else
-                                echo 'Cgroups already configured'
-                            fi";
+                            let cmd_cgroups = "if [ -f /boot/firmware/cmdline.txt ]; then
+                                 if ! grep -q 'cgroup_memory=1' /boot/firmware/cmdline.txt; then
+                                     sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/firmware/cmdline.txt
+                                     echo 'Updated /boot/firmware/cmdline.txt'
+                                 else
+                                     echo 'Cgroups already configured in /boot/firmware/cmdline.txt'
+                                 fi
+                             elif [ -f /boot/cmdline.txt ]; then
+                                 if ! grep -q 'cgroup_memory=1' /boot/cmdline.txt; then
+                                     sudo sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
+                                     echo 'Updated /boot/cmdline.txt'
+                                 else
+                                     echo 'Cgroups already configured in /boot/cmdline.txt'
+                                 fi
+                             elif [ -f /boot/extlinux/extlinux.conf ]; then
+                                 if ! grep -q 'cgroup_memory=1' /boot/extlinux/extlinux.conf; then
+                                     sudo sed -i '/^APPEND/ s/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' /boot/extlinux/extlinux.conf
+                                     echo 'Updated /boot/extlinux/extlinux.conf'
+                                 else
+                                     echo 'Cgroups already configured in /boot/extlinux/extlinux.conf'
+                                 fi
+                             else
+                                 echo 'No supported boot configuration file found'
+                                 exit 1
+                             fi";
                             let running_cgroups =
                                 format!("      * Configuring cgroups ... {}", "∨".blue());
                             let success_cgroups =
